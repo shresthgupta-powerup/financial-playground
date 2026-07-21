@@ -136,7 +136,7 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
     elif template_key == "child_education":
         base.update(
             name="Child Education", description="Annual education fees",
-            nature="Non-replenishing", structure="Recurring", type="Non-Negotiable",
+            nature="Replenishing", structure="Recurring", type="Non-Negotiable",
             start_date_mode="Fixed", start_date=add_years(today, 12),
             amount=1_500_000, frequency="Annual", end_mode="Occurrences",
             occurrences=4, inflation_percent=8.0,
@@ -159,10 +159,15 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
 
 
 def normalise_goal(goal: dict) -> dict:
-    """Progressive-disclosure reset (mirror planForm.normaliseGoal)."""
+    """Progressive-disclosure reset (mirror planForm.normaliseGoal).
+
+    Playground rule: structure is derived from nature, never chosen —
+    Replenishing (many payouts) is always Recurring, Non-replenishing (a single
+    payout) is always Lumpsum. The engine still accepts the other two
+    combinations; this UI layer simply never produces them.
+    """
     g = dict(goal)
-    if g["nature"] == "Replenishing":
-        g["structure"] = "Recurring"
+    g["structure"] = "Recurring" if g["nature"] == "Replenishing" else "Lumpsum"
     if g["structure"] == "Lumpsum":
         g["frequency"] = None
         g["end_mode"] = None
@@ -336,18 +341,18 @@ def render_goal(g: dict) -> None:
     r2c1, r2c2, r2c3 = st.columns(3)
     g["nature"] = r2c1.selectbox(
         "Nature", GOAL_NATURES, index=GOAL_NATURES.index(g["nature"]), key=f"g_nature_{uid}",
-        help="Replenishing = ongoing payout (expense) funded via the Debt/Hybrid pools; "
-             "Non-replenishing = provisioned via a glide path.",
+        help="Non-replenishing = a single one-time payout (provisioned via a glide path). "
+             "Replenishing = multiple payouts over time (funded via the Debt/Hybrid pools).",
     )
+    # Structure is derived from nature, not chosen: Replenishing -> Recurring,
+    # Non-replenishing -> Lumpsum. The engine still accepts the other
+    # combinations; the playground UI just doesn't offer them.
     if g["nature"] == "Replenishing":
         g["structure"] = "Recurring"
-        r2c2.caption("Structure: Recurring (always, for Replenishing)")
+        r2c2.caption("Structure: **Recurring**")
     else:
-        g["structure"] = r2c2.selectbox(
-            "Structure", GOAL_STRUCTURES,
-            index=GOAL_STRUCTURES.index(g["structure"] if g["structure"] in GOAL_STRUCTURES else "Lumpsum"),
-            key=f"g_struct_{uid}",
-        )
+        g["structure"] = "Lumpsum"
+        r2c2.caption("Structure: **Lumpsum**")
         g["type"] = r2c3.selectbox(
             "Type", GOAL_TYPES, index=GOAL_TYPES.index(g["type"]), key=f"g_type_{uid}",
             help="Selects the glide-path sheet used to provision this goal.",
@@ -392,9 +397,6 @@ def render_goal(g: dict) -> None:
             g["end_date"] = month_year_input(
                 r5c3, "End date", g["end_date"] or g["start_date"], f"g_end_{uid}"
             )
-        if g["nature"] == "Non-replenishing":
-            st.caption("Non-replenishing recurring goals may span at most 4 years "
-                       "first-to-last payment (engine performance guard).")
 
 
 def render_one_time(w: dict) -> None:
@@ -669,4 +671,5 @@ def main() -> None:
         render_results(st.session_state.run_output)
 
 
-main()
+if __name__ == "__main__":
+    main()
