@@ -1,0 +1,10 @@
+# Streamlit playground runtime. Engine lines mirror the handoff's
+# requirements.txt (versions = the app backend's lower bounds, 2026-07-17).
+streamlit>=1.40.0
+pandas>=3.0.0
+numpy>=2.0.0
+python-dateutil>=2.9.0
+pydantic>=2.9.0          # only for code/app/planning/schemas.py
+openpyxl>=3.1.0          # advisor Excel export
+psycopg2-binary>=2.9.0   # import-time need of glide_paths_repo.py only (app-coupled, reference)
+pytest>=8.0.0            # to run code/tests (the executable spec)
