@@ -302,6 +302,14 @@ def csv_with_summary(comprehensive_df: pd.DataFrame) -> bytes:
     return out.to_csv(index=False).encode("utf-8")
 
 
+def inputs_filename(config: dict) -> str:
+    """Unique, human-sortable filename: client + timestamp, filesystem-safe."""
+    raw = (config.get("client_name") or "plan").strip() or "plan"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-") or "plan"
+    stamp = pd.Timestamp.now().strftime("%Y-%m-%d_%H%M")
+    return f"financial_plan_inputs_{slug}_{stamp}.json"
+
+
 def _iso_or_none(d):
     """Serialise a date to 'YYYY-MM-01' (month grid), or None."""
     if d is None:
@@ -670,7 +678,7 @@ def render_results(out: dict) -> None:
         # Inputs are still worth capturing even when the plan is infeasible.
         st.download_button(
             "📥 Download inputs (JSON)", data=build_inputs_json(out["config"]),
-            file_name="financial_plan_inputs.json", mime="application/json",
+            file_name=inputs_filename(out["config"]), mime="application/json",
             key="dl_inputs_infeasible",
         )
         return
@@ -716,7 +724,7 @@ def render_results(out: dict) -> None:
     )
     d3.download_button(
         "📥 Inputs (JSON)", data=build_inputs_json(out["config"]),
-        file_name="financial_plan_inputs.json", mime="application/json",
+        file_name=inputs_filename(out["config"]), mime="application/json",
         key="dl_inputs_success",
     )
 
