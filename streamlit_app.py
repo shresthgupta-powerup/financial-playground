@@ -30,7 +30,7 @@ from app.planning import (
     run_simulation,
 )
 from app.planning.advisor_export import build_advisor_workbook
-from app.planning.engine import _DEFAULT_INSTRUMENT_PARAMS, format_inr
+from app.planning.engine import _DEFAULT_INSTRUMENT_PARAMS, _resolve_goals, format_inr
 from app.planning.schemas import RISK_PROFILE_CORE_RETURNS
 
 # ── Picklists (mirror planForm.js) ──────────────────────────────────────────
@@ -320,17 +320,92 @@ def _iso_or_none(d):
         return None
 
 
-def build_inputs_json(config: dict) -> bytes:
-    """Serialise exactly the inputs the user supplied, as pretty JSON bytes.
+# ── CRM goal-import contract (CRM team, 2026-07-29) ─────────────────────────
+# The goals array of this file is imported into the CRM as official goals, so
+# it follows the CRM's strict field contract:
+# - nature speaks the ENGINE vocabulary (Replenishing / Non-replenishing).
+#   This is the one deliberate exception to the display-rename rule — the CRM
+#   contract requires these exact values in this machine-read file. The UI
+#   still shows Recurring / Lumpsum everywhere.
+# - structure accompanies Non-replenishing goals only (ignored for
+#   Replenishing); end_mode is never exported on resolved goals — a concrete
+#   occurrences count takes its place.
+# - type / frequency casing standardised to the CRM picklists.
+_TYPE_TO_CRM = {"Non-Negotiable": "Non-negotiable", "Semi-Negotiable": "Semi-negotiable"}
+_FREQ_TO_CRM = {"Half-Yearly": "Half-yearly"}
+_FREQ_MONTHS = {"Monthly": 1, "Quarterly": 3, "Half-Yearly": 6, "Annual": 12}
 
-    A faithful record of the form, not an engine dump:
-    - dates become 'YYYY-MM-01' strings (the month grid);
-    - nature/structure use the advisor-facing words (Recurring / Lumpsum),
-      which is what the user actually picked and keeps the file free of the
-      engine's internal vocabulary;
-    - the internal 'm3_id' the app injects for the engine is dropped.
-    Re-loading this later maps the words back via NATURE_FROM_DISPLAY.
+
+def _crm_goal(g: dict, resolved: bool) -> dict:
+    """One goals-array entry, keys ordered as in the CRM's example.
+
+    resolved=True (successful run): contract shape — start_date_mode is always
+    "Fixed" with the actual date ("At retirement" resolved to the solved
+    retirement date by engine._resolve_goals), occurrences is the concrete
+    count ("Lifetime" collapsed against the plan's death date), and end_date is
+    the computed last-payment date. resolved=False (infeasible run — nothing
+    solved to resolve against): the goal is recorded exactly as entered.
     """
+    goal = {"name": g.get("name")}
+    if g.get("description"):
+        goal["description"] = g["description"]
+    goal["type"] = _TYPE_TO_CRM.get(g.get("type"), g.get("type"))
+    goal["nature"] = g.get("nature")
+    if g.get("nature") != "Replenishing":
+        goal["structure"] = g.get("structure")
+    recurring = g.get("structure") == "Recurring"
+    freq = g.get("frequency")
+    if resolved:
+        start = pd.Timestamp(g["start_date"])
+        goal["start_date_mode"] = "Fixed"
+        goal["start_date"] = start.strftime("%Y-%m-01")
+        goal["amount"] = g.get("amount")
+        if recurring:
+            occ = int(g.get("occurrences") or 1)
+            goal["frequency"] = _FREQ_TO_CRM.get(freq, freq)
+            goal["occurrences"] = occ
+            months = _FREQ_MONTHS.get(freq)
+            if months:
+                goal["end_date"] = (
+                    start + pd.DateOffset(months=months * (occ - 1))
+                ).strftime("%Y-%m-01")
+    else:
+        goal["start_date_mode"] = g.get("start_date_mode")
+        goal["start_date"] = _iso_or_none(g.get("start_date"))
+        goal["amount"] = g.get("amount")
+        if recurring:
+            goal["frequency"] = _FREQ_TO_CRM.get(freq, freq)
+            goal["occurrences"] = g.get("occurrences")
+            goal["end_mode"] = g.get("end_mode")
+            goal["end_date"] = _iso_or_none(g.get("end_date"))
+    goal["inflation_percent"] = g.get("inflation_percent")
+    return goal
+
+
+def build_inputs_json(config: dict, retirement_date=None) -> bytes:
+    """Serialise the user's inputs as pretty JSON bytes; goals are CRM-ready.
+
+    The goals array follows the CRM import contract (see _crm_goal): engine
+    nature vocabulary, standardised casings and — when retirement_date is given
+    (a successful run) — concrete dates and occurrence counts resolved by the
+    engine's own _resolve_goals, so the file matches the simulation exactly.
+    Everything else stays a faithful record of the form (the CRM reads only
+    goals + personal.client_name + generated_at and ignores the rest):
+    - dates become 'YYYY-MM-01' strings (the month grid);
+    - the internal 'm3_id' the app injects for the engine is dropped.
+    """
+    goals_in = config.get("goals", []) or []
+    if retirement_date is not None:
+        death_date = pd.Timestamp(config["current_date"]) + pd.DateOffset(
+            years=int(float(config.get("target_lifetime", 90))
+                      - float(config.get("current_age", 30)))
+        )
+        goals_out = [
+            _crm_goal(g, resolved=True)
+            for g in _resolve_goals(goals_in, pd.Timestamp(retirement_date), death_date)
+        ]
+    else:
+        goals_out = [_crm_goal(g, resolved=False) for g in goals_in]
     doc = {
         "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         "engine_version": ENGINE_SOURCE_SHA,
@@ -356,24 +431,7 @@ def build_inputs_json(config: dict) -> bytes:
             }
             for s in config.get("investment_streams", []) or []
         ],
-        "goals": [
-            {
-                "name": g.get("name"),
-                "description": g.get("description", ""),
-                "type": g.get("type"),
-                "nature": _display_text(g.get("nature")),
-                "structure": _display_text(g.get("structure")),
-                "start_date_mode": g.get("start_date_mode"),
-                "start_date": _iso_or_none(g.get("start_date")),
-                "amount": g.get("amount"),
-                "frequency": g.get("frequency"),
-                "occurrences": g.get("occurrences"),
-                "end_mode": g.get("end_mode"),
-                "end_date": _iso_or_none(g.get("end_date")),
-                "inflation_percent": g.get("inflation_percent"),
-            }
-            for g in config.get("goals", []) or []
-        ],
+        "goals": goals_out,
         "one_time_investments": [
             {
                 "name": w.get("name"),
@@ -723,9 +781,13 @@ def render_results(out: dict) -> None:
         file_name="financial_plan_monthly.csv", mime="text/csv",
     )
     d3.download_button(
-        "📥 Inputs (JSON)", data=build_inputs_json(out["config"]),
+        "📥 Inputs (JSON)", data=build_inputs_json(out["config"], out["retirement_date"]),
         file_name=inputs_filename(out["config"]), mime="application/json",
         key="dl_inputs_success",
+    )
+    st.caption(
+        "The JSON's goals carry concrete dates from this run — 'At retirement' "
+        "becomes the solved date, Lifetime becomes a payment count — ready for CRM import."
     )
 
 
