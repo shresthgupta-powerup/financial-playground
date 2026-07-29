@@ -11,6 +11,7 @@ itself is not imported because it pulls the app-coupled DB modules.
 
 import copy
 import io
+import json
 import re
 import sys
 from pathlib import Path
@@ -299,6 +300,82 @@ def csv_with_summary(comprehensive_df: pd.DataFrame) -> bytes:
     out["Goal Tranches (Rs)"] = out[goal_value_cols].fillna(0).sum(axis=1) if goal_value_cols else 0.0
     out.columns = [_display_text(c) for c in out.columns]
     return out.to_csv(index=False).encode("utf-8")
+
+
+def _iso_or_none(d):
+    """Serialise a date to 'YYYY-MM-01' (month grid), or None."""
+    if d is None:
+        return None
+    try:
+        return pd.Timestamp(d).strftime("%Y-%m-01")
+    except Exception:
+        return None
+
+
+def build_inputs_json(config: dict) -> bytes:
+    """Serialise exactly the inputs the user supplied, as pretty JSON bytes.
+
+    A faithful record of the form, not an engine dump:
+    - dates become 'YYYY-MM-01' strings (the month grid);
+    - nature/structure use the advisor-facing words (Recurring / Lumpsum),
+      which is what the user actually picked and keeps the file free of the
+      engine's internal vocabulary;
+    - the internal 'm3_id' the app injects for the engine is dropped.
+    Re-loading this later maps the words back via NATURE_FROM_DISPLAY.
+    """
+    doc = {
+        "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "engine_version": ENGINE_SOURCE_SHA,
+        "glidepath_version": GLIDEPATH_VERSION,
+        "personal": {
+            "client_name": config.get("client_name", ""),
+            "current_date": _iso_or_none(config.get("current_date")),
+            "current_age": config.get("current_age"),
+            "target_lifetime": config.get("target_lifetime"),
+            "current_corpus": config.get("current_corpus"),
+            "risk_profile": config.get("risk_profile"),
+        },
+        "investment_streams": [
+            {
+                "name": s.get("name"),
+                "amount": s.get("amount"),
+                "start_date": _iso_or_none(s.get("start_date")),
+                "end_date_mode": s.get("end_date_mode"),
+                "end_date": _iso_or_none(s.get("end_date")),
+                "step_up_percent": s.get("step_up_percent"),
+                "step_up_frequency": s.get("step_up_frequency"),
+                "step_up_date": _iso_or_none(s.get("step_up_date")),
+            }
+            for s in config.get("investment_streams", []) or []
+        ],
+        "goals": [
+            {
+                "name": g.get("name"),
+                "description": g.get("description", ""),
+                "type": g.get("type"),
+                "nature": _display_text(g.get("nature")),
+                "structure": _display_text(g.get("structure")),
+                "start_date_mode": g.get("start_date_mode"),
+                "start_date": _iso_or_none(g.get("start_date")),
+                "amount": g.get("amount"),
+                "frequency": g.get("frequency"),
+                "occurrences": g.get("occurrences"),
+                "end_mode": g.get("end_mode"),
+                "end_date": _iso_or_none(g.get("end_date")),
+                "inflation_percent": g.get("inflation_percent"),
+            }
+            for g in config.get("goals", []) or []
+        ],
+        "one_time_investments": [
+            {
+                "name": w.get("name"),
+                "date": _iso_or_none(w.get("date")),
+                "amount": w.get("amount"),
+            }
+            for w in config.get("one_time_investments", []) or []
+        ],
+    }
+    return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8")
 
 
 def translate_workbook(xlsx_bytes: bytes) -> bytes:
@@ -590,6 +667,12 @@ def render_results(out: dict) -> None:
             st.dataframe(out["goal_table"], use_container_width=True, hide_index=True)
         st.caption("Try: lower goal amounts, later goal dates, higher investments, "
                    "or a more aggressive risk profile.")
+        # Inputs are still worth capturing even when the plan is infeasible.
+        st.download_button(
+            "📥 Download inputs (JSON)", data=build_inputs_json(out["config"]),
+            file_name="financial_plan_inputs.json", mime="application/json",
+            key="dl_inputs_infeasible",
+        )
         return
 
     ret = out["retirement_date"]
@@ -621,7 +704,7 @@ def render_results(out: dict) -> None:
     st.dataframe(out["goal_table"], use_container_width=True, hide_index=True)
 
     st.subheader("Downloads")
-    d1, d2 = st.columns(2)
+    d1, d2, d3 = st.columns(3)
     d1.download_button(
         "📗 Advisor workbook (Excel)", data=out["workbook"],
         file_name="financial_plan_advisor.xlsx",
@@ -630,6 +713,11 @@ def render_results(out: dict) -> None:
     d2.download_button(
         "📄 Comprehensive monthly (CSV)", data=out["csv"],
         file_name="financial_plan_monthly.csv", mime="text/csv",
+    )
+    d3.download_button(
+        "📥 Inputs (JSON)", data=build_inputs_json(out["config"]),
+        file_name="financial_plan_inputs.json", mime="application/json",
+        key="dl_inputs_success",
     )
 
 
