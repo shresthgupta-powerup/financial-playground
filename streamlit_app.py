@@ -82,6 +82,9 @@ def fmt_mon_yyyy(ts) -> str:
 _DISPLAY_SUBS = (
     (re.compile(r"non[- ]replenishing", re.I), "Lumpsum"),
     (re.compile(r"replenishing", re.I), "Recurring"),
+    # The engine labels pool refills "Replenishment: <pool>" — a third form of
+    # the banned word family, seen in failure reasons and pool ledger rows.
+    (re.compile(r"replenishment", re.I), "Refill"),
 )
 
 
@@ -471,6 +474,134 @@ def translate_workbook(xlsx_bytes: bytes) -> bytes:
     return buf.getvalue()
 
 
+# ── Load a downloaded inputs JSON back into the form ────────────────────────
+_TYPE_FROM_CRM = {v: k for k, v in _TYPE_TO_CRM.items()}
+_FREQ_FROM_CRM = {v: k for k, v in _FREQ_TO_CRM.items()}
+
+
+def form_state_from_inputs(doc: dict):
+    """Map an inputs JSON (either export shape) back to form state.
+
+    Tolerant on vocabulary: nature accepts the engine words
+    (Replenishing/Non-replenishing) and the display words (Recurring/Lumpsum);
+    type/frequency accept both our casing and the CRM casing. Resolved exports
+    carry no end_mode — their concrete occurrences count maps to
+    end_mode="Occurrences", which reproduces the same payout schedule.
+    Returns (personal, streams, goals, one_time); raises ValueError on files
+    that aren't an inputs JSON.
+    """
+    if not isinstance(doc, dict) or "personal" not in doc or "goals" not in doc:
+        raise ValueError("not an inputs JSON (missing 'personal'/'goals')")
+    today = month_start_today()
+
+    def ts(v, fallback=None):
+        if not v:
+            return fallback
+        try:
+            t = pd.Timestamp(v)
+            return pd.Timestamp(t.year, t.month, 1)
+        except (ValueError, TypeError):
+            return fallback
+
+    p = doc.get("personal") or {}
+    risk = p.get("risk_profile")
+    personal = {
+        "client_name": str(p.get("client_name") or ""),
+        "current_date": ts(p.get("current_date"), today),
+        "current_age": int(float(p.get("current_age") or 30)),
+        "target_lifetime": int(float(p.get("target_lifetime") or 90)),
+        "current_corpus": int(float(p.get("current_corpus") or 0)),
+        "risk_profile": risk if risk in RISK_PROFILES else "Balanced",
+    }
+
+    streams = []
+    for s in doc.get("investment_streams") or []:
+        start = ts(s.get("start_date"), today)
+        mode = s.get("end_date_mode")
+        streams.append({
+            "name": str(s.get("name") or f"Stream {len(streams) + 1}"),
+            "amount": int(float(s.get("amount") or 0)),
+            "start_date": start,
+            "end_date_mode": mode if mode in INVESTMENT_END_MODES else "At retirement",
+            "end_date": ts(s.get("end_date"), add_years(start, 20)),
+            "step_up_percent": float(s.get("step_up_percent") or 0.0),
+            "step_up_frequency": s.get("step_up_frequency")
+            if s.get("step_up_frequency") in STEPUP_FREQUENCIES else "Annual",
+            "step_up_date": ts(s.get("step_up_date"), start),
+        })
+
+    goals = []
+    for g in doc.get("goals") or []:
+        nature = NATURE_FROM_DISPLAY.get(g.get("nature"), g.get("nature"))
+        if nature not in GOAL_NATURES:
+            nature = "Non-replenishing"
+        gtype = _TYPE_FROM_CRM.get(g.get("type"), g.get("type"))
+        if gtype not in GOAL_TYPES:
+            gtype = "Non-Negotiable"
+        freq = _FREQ_FROM_CRM.get(g.get("frequency"), g.get("frequency"))
+        end_mode = g.get("end_mode")
+        if end_mode not in GOAL_END_MODES:
+            end_mode = "Occurrences"
+        mode = g.get("start_date_mode")
+        goals.append(normalise_goal({
+            "name": str(g.get("name") or f"Goal {len(goals) + 1}"),
+            "description": str(g.get("description") or ""),
+            "type": gtype,
+            "nature": nature,
+            "structure": "Recurring" if nature == "Replenishing" else "Lumpsum",
+            "start_date_mode": mode if mode in GOAL_START_MODES else "Fixed",
+            "start_date": ts(g.get("start_date"), add_years(today, 15)),
+            "amount": int(float(g.get("amount") or 0)),
+            "frequency": freq if freq in RECURRING_FREQUENCIES else "Annual",
+            "occurrences": int(float(g.get("occurrences") or 1)),
+            "end_mode": end_mode,
+            "end_date": ts(g.get("end_date")),
+            "inflation_percent": float(g.get("inflation_percent") or 6.0),
+        }))
+
+    one_time = []
+    for w in doc.get("one_time_investments") or []:
+        one_time.append({
+            "name": str(w.get("name") or f"Investment {len(one_time) + 1}"),
+            "date": ts(w.get("date"), today),
+            "amount": int(float(w.get("amount") or 0)),
+        })
+    return personal, streams, goals, one_time
+
+
+_PERSONAL_WIDGET_KEYS = (
+    "p_client", "p_curdate_m", "p_curdate_y", "p_age", "p_life", "p_corpus", "p_risk",
+)
+
+
+def _apply_uploaded_inputs():
+    """st.button callback: load the uploaded JSON into the form."""
+    file = st.session_state.get("inputs_uploader")
+    if file is None:
+        st.session_state.upload_msg = ("error", "Choose a JSON file first.")
+        return
+    try:
+        doc = json.loads(file.getvalue().decode("utf-8"))
+        personal, streams, goals, one_time = form_state_from_inputs(doc)
+    except (ValueError, UnicodeDecodeError) as e:
+        st.session_state.upload_msg = ("error", f"Could not read that file: {e}")
+        return
+    for item in streams + goals + one_time:
+        item["_uid"] = _next_uid()
+    st.session_state.streams = streams
+    st.session_state.goals = goals
+    st.session_state.one_time = one_time
+    st.session_state.personal_defaults = personal
+    # Personal widgets re-initialise from the new defaults on the next render.
+    for key in _PERSONAL_WIDGET_KEYS:
+        st.session_state.pop(key, None)
+    st.session_state.run_output = None
+    st.session_state.upload_msg = (
+        "success",
+        f"Loaded inputs for “{personal['client_name'] or 'plan'}” — review and press Run simulation.",
+    )
+
+
 # ── Widgets ─────────────────────────────────────────────────────────────────
 def month_year_input(container, label: str, ts, key: str) -> pd.Timestamp:
     """Month + year picker (the engine's grid is monthly — day is always the 1st)."""
@@ -506,6 +637,14 @@ def init_state() -> None:
     for item in st.session_state.streams + st.session_state.goals:
         item["_uid"] = _next_uid()
     st.session_state.run_output = None
+    st.session_state.personal_defaults = {
+        "client_name": "",
+        "current_date": today,
+        "current_age": 30,
+        "target_lifetime": 90,
+        "current_corpus": 10_000_000,
+        "risk_profile": "Balanced",
+    }
 
 
 # ── Form sections ───────────────────────────────────────────────────────────
@@ -676,15 +815,30 @@ def run_plan(config: dict) -> dict:
 
     if not solved["success"]:
         # Infeasible: diagnostic run at the lifetime end (mirrors service.py).
-        _s, _t, failure, _p, _g, _c = run_simulation(
+        # Its outputs are still worth downloading — the workbook carries the
+        # failure rows, and the comprehensive view exists for the corpus-
+        # depletion failure class (it is empty by design for debt-pool
+        # depletion, in which case the CSV is simply not offered).
+        _s, _t, failure, pools_df, goal_dfs, comp_df = run_simulation(
             config, death_date, instrument_params, glide_paths
         )
+        diag_result = {"success": False, "retirement_date": None, "failure": failure}
+        try:
+            workbook = translate_workbook(build_advisor_workbook(
+                config, diag_result, comprehensive_df=comp_df, snapshot=None,
+                goal_dfs=goal_dfs, pool_movements_df=pools_df,
+            ))
+        except Exception:
+            workbook = None  # degrade to no workbook rather than a dead screen
         return {
             "kind": "infeasible",
             "config": config,
             "failure": failure,
             "solver_failure": solved.get("failure"),
             "goal_table": build_goal_results(config, None),
+            "workbook": workbook,
+            "csv": csv_with_summary(comp_df)
+            if comp_df is not None and not comp_df.empty else None,
         }
 
     retirement_date = pd.Timestamp(solved["retirement_date"])
@@ -733,11 +887,30 @@ def render_results(out: dict) -> None:
             st.dataframe(out["goal_table"], use_container_width=True, hide_index=True)
         st.caption("Try: lower goal amounts, later goal dates, higher investments, "
                    "or a more aggressive risk profile.")
-        # Inputs are still worth capturing even when the plan is infeasible.
-        st.download_button(
-            "📥 Download inputs (JSON)", data=build_inputs_json(out["config"]),
+        st.subheader("Downloads")
+        d1, d2, d3 = st.columns(3)
+        if out.get("workbook"):
+            d1.download_button(
+                "📗 Advisor workbook (Excel)", data=out["workbook"],
+                file_name="financial_plan_advisor.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_wb_infeasible",
+            )
+        if out.get("csv"):
+            d2.download_button(
+                "📄 Comprehensive monthly (CSV)", data=out["csv"],
+                file_name="financial_plan_monthly.csv", mime="text/csv",
+                key="dl_csv_infeasible",
+            )
+        d3.download_button(
+            "📥 Inputs (JSON)", data=build_inputs_json(out["config"]),
             file_name=inputs_filename(out["config"]), mime="application/json",
             key="dl_inputs_infeasible",
+        )
+        st.caption(
+            "Diagnostic outputs: no feasible retirement exists, so the workbook/CSV "
+            "reflect a run at the latest possible retirement (lifetime end), "
+            "including the failure and shortfall rows."
         )
         return
 
@@ -803,22 +976,38 @@ def main() -> None:
         "byte-identical copy of the production Financial Plan engine (CRM handoff, 2026-07-17)."
     )
 
-    # Sidebar: personal & corpus + risk profile
+    # Sidebar: personal & corpus + risk profile. Defaults come from
+    # personal_defaults so a loaded JSON can re-seed every widget.
+    d = st.session_state.personal_defaults
     with st.sidebar:
         st.header("Personal & Corpus")
-        client_name = st.text_input("Client name (Excel header only)", value="")
-        current_date = month_year_input(st, "Plan start", today, "p_curdate")
+        client_name = st.text_input("Client name (Excel header only)",
+                                    value=d["client_name"], key="p_client")
+        current_date = month_year_input(st, "Plan start", d["current_date"], "p_curdate")
         c1, c2 = st.columns(2)
-        current_age = c1.number_input("Current age", min_value=0, max_value=110, value=30, step=1)
-        target_lifetime = c2.number_input("Target lifetime", min_value=1, max_value=120, value=90, step=1)
-        current_corpus = money_input(st, "Current corpus (₹)", 10_000_000, "p_corpus")
+        current_age = c1.number_input("Current age", min_value=0, max_value=110,
+                                      value=int(d["current_age"]), step=1, key="p_age")
+        target_lifetime = c2.number_input("Target lifetime", min_value=1, max_value=120,
+                                          value=int(d["target_lifetime"]), step=1, key="p_life")
+        current_corpus = money_input(st, "Current corpus (₹)", d["current_corpus"], "p_corpus")
         risk_profile = st.selectbox("Risk profile", RISK_PROFILES,
-                                    index=RISK_PROFILES.index("Balanced"))
+                                    index=RISK_PROFILES.index(d["risk_profile"]), key="p_risk")
         st.caption(
             f"Core-corpus return the engine will use: "
             f"**{RISK_PROFILE_CORE_RETURNS[risk_profile] * 100:g}%** · "
             "fixed pool returns: debt 6%, hybrid 10%."
         )
+        st.divider()
+        with st.expander("📂 Load inputs JSON"):
+            st.file_uploader(
+                "A financial_plan_inputs_*.json downloaded from this app",
+                type=["json"], key="inputs_uploader",
+            )
+            st.button("Load into form", on_click=_apply_uploaded_inputs,
+                      use_container_width=True)
+        msg = st.session_state.pop("upload_msg", None)
+        if msg is not None:
+            (st.success if msg[0] == "success" else st.error)(msg[1])
 
     personal = {
         "client_name": client_name,
