@@ -649,10 +649,14 @@ def render_goal(g: dict) -> None:
             index=GOAL_STRUCTURES.index(g["structure"] if g["structure"] in GOAL_STRUCTURES else "Lumpsum"),
             key=f"g_struct_{uid}",
         )
-        g["type"] = r2c3.selectbox(
-            "Type", GOAL_TYPES, index=GOAL_TYPES.index(g["type"]), key=f"g_type_{uid}",
-            help="Selects the glide-path sheet used to provision this goal.",
-        )
+    # Type shows for BOTH natures (2026-08-21): the CRM stores a priority on
+    # every goal. The engine reads it only for Non-replenishing goals (glide
+    # sheet selection); on Replenishing goals it is metadata for the exports.
+    g["type"] = r2c3.selectbox(
+        "Type", GOAL_TYPES, index=GOAL_TYPES.index(g["type"]), key=f"g_type_{uid}",
+        help="Goal priority. For Non-replenishing goals it also selects the "
+             "glide-path sheet used to provision the goal.",
+    )
 
     r3c1, r3c2 = st.columns([2, 2])
     g["start_date_mode"] = r3c1.selectbox(
