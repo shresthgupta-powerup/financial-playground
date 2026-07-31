@@ -10,7 +10,6 @@ itself is not imported because it pulls the app-coupled DB modules.
 """
 
 import copy
-import io
 import json
 import re
 import sys
@@ -37,12 +36,13 @@ from app.planning.schemas import RISK_PROFILE_CORE_RETURNS
 GOAL_TYPES = ["Non-Negotiable", "Semi-Negotiable", "Negotiable"]
 GOAL_NATURES = ["Non-replenishing", "Replenishing"]
 
-# Display-only rename: the engine's vocabulary ("Replenishing"/"Non-replenishing")
-# is never shown to a user. Every user-facing surface — the app screens, the
-# advisor Excel and the monthly CSV — is translated through _display_text()
-# below. The config handed to the engine always carries the engine's own values.
-NATURE_DISPLAY = {"Non-replenishing": "Lumpsum", "Replenishing": "Recurring"}
-NATURE_FROM_DISPLAY = {v: k for k, v in NATURE_DISPLAY.items()}
+# 2026-08-14: the two-layer selection is back (nature first; Non-replenishing
+# goals additionally choose a Lumpsum/Recurring structure), reverting the
+# 2026-07-30 payout-count rule AND the display rename that depended on it —
+# with a structure picker present, nature must be shown under its own names.
+# Loading files saved during the rename era still works: NATURE_FROM_DISPLAY
+# maps their display words back (see form_state_from_inputs).
+NATURE_FROM_DISPLAY = {"Lumpsum": "Non-replenishing", "Recurring": "Replenishing"}
 GOAL_STRUCTURES = ["Lumpsum", "Recurring"]
 GOAL_START_MODES = ["Fixed", "At retirement"]
 GOAL_END_MODES = ["Occurrences", "Fixed date", "Lifetime"]
@@ -77,28 +77,6 @@ def add_years(ts: pd.Timestamp, years: int) -> pd.Timestamp:
 
 def fmt_mon_yyyy(ts) -> str:
     return pd.Timestamp(ts).strftime("%b %Y")
-
-
-_DISPLAY_SUBS = (
-    (re.compile(r"non[- ]replenishing", re.I), "Lumpsum"),
-    (re.compile(r"replenishing", re.I), "Recurring"),
-    # The engine labels pool refills "Replenishment: <pool>" — a third form of
-    # the banned word family, seen in failure reasons and pool ledger rows.
-    (re.compile(r"replenishment", re.I), "Refill"),
-)
-
-
-def _display_text(value):
-    """Translate the engine's nature vocabulary into the advisor-facing words.
-
-    Order matters: 'Non-replenishing' is matched before the bare 'Replenishing'.
-    Non-strings pass through untouched.
-    """
-    if not isinstance(value, str):
-        return value
-    for pattern, replacement in _DISPLAY_SUBS:
-        value = pattern.sub(replacement, value)
-    return value
 
 
 def short_inr(amount) -> str:
@@ -168,7 +146,7 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
     elif template_key == "child_education":
         base.update(
             name="Child Education", description="Annual education fees",
-            nature="Replenishing", structure="Recurring", type="Non-Negotiable",
+            nature="Non-replenishing", structure="Recurring", type="Non-Negotiable",
             start_date_mode="Fixed", start_date=add_years(today, 12),
             amount=1_500_000, frequency="Annual", end_mode="Occurrences",
             occurrences=4, inflation_percent=8.0,
@@ -193,13 +171,14 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
 def normalise_goal(goal: dict) -> dict:
     """Progressive-disclosure reset (mirror planForm.normaliseGoal).
 
-    Playground rule: structure is derived from nature, never chosen —
-    Replenishing (many payouts) is always Recurring, Non-replenishing (a single
-    payout) is always Lumpsum. The engine still accepts the other two
-    combinations; this UI layer simply never produces them.
+    Replenishing goals are always a recurring payout stream; Non-replenishing
+    goals carry their own Lumpsum/Recurring structure choice.
     """
     g = dict(goal)
-    g["structure"] = "Recurring" if g["nature"] == "Replenishing" else "Lumpsum"
+    if g["nature"] == "Replenishing":
+        g["structure"] = "Recurring"
+    if g.get("structure") not in GOAL_STRUCTURES:
+        g["structure"] = "Lumpsum"
     if g["structure"] == "Lumpsum":
         g["frequency"] = None
         g["end_mode"] = None
@@ -266,7 +245,8 @@ def build_goal_results(config: dict, retirement_date) -> pd.DataFrame:
         inflation = float(goal.get("inflation_percent", 0) or 0)
         rows.append({
             "Goal": goal.get("name", ""),
-            "Nature": _display_text(goal.get("nature", "")),
+            "Nature": goal.get("nature", ""),
+            "Structure": goal.get("structure", ""),
             "Starts": fmt_mon_yyyy(start),
             "Amount (today's ₹)": format_inr(pv),
             "Amount at start (FV)": format_inr(pv * ((1 + inflation / 100) ** years)),
@@ -291,17 +271,12 @@ _POOL_VALUE_COLS = {"Core Corpus Value", "Debt Pool Value", "Hybrid Pool Value"}
 
 
 def csv_with_summary(comprehensive_df: pd.DataFrame) -> bytes:
-    """Port of service.append_csv_summary_cols + to_csv.
-
-    Column headers are translated last: the engine names one column
-    'Replenishing Payouts', which would otherwise reach the advisor's CSV.
-    """
+    """Port of service.append_csv_summary_cols + to_csv."""
     out = comprehensive_df.copy()
     value_cols = [c for c in out.columns if c.endswith("Value")]
     goal_value_cols = [c for c in value_cols if c not in _POOL_VALUE_COLS]
     out["Total Wealth (Rs)"] = out[value_cols].fillna(0).sum(axis=1)
     out["Goal Tranches (Rs)"] = out[goal_value_cols].fillna(0).sum(axis=1) if goal_value_cols else 0.0
-    out.columns = [_display_text(c) for c in out.columns]
     return out.to_csv(index=False).encode("utf-8")
 
 
@@ -326,10 +301,8 @@ def _iso_or_none(d):
 # ── CRM goal-import contract (CRM team, 2026-07-29) ─────────────────────────
 # The goals array of this file is imported into the CRM as official goals, so
 # it follows the CRM's strict field contract:
-# - nature speaks the ENGINE vocabulary (Replenishing / Non-replenishing).
-#   This is the one deliberate exception to the display-rename rule — the CRM
-#   contract requires these exact values in this machine-read file. The UI
-#   still shows Recurring / Lumpsum everywhere.
+# - nature is Replenishing / Non-replenishing (the same vocabulary the UI
+#   shows again since the 2026-08-14 revert).
 # - structure accompanies Non-replenishing goals only (ignored for
 #   Replenishing); end_mode is never exported on resolved goals — a concrete
 #   occurrences count takes its place.
@@ -447,33 +420,6 @@ def build_inputs_json(config: dict, retirement_date=None) -> bytes:
     return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def translate_workbook(xlsx_bytes: bytes) -> bytes:
-    """Rewrite every user-visible string in the advisor workbook.
-
-    The workbook is produced by the untouched engine copy, so it still speaks
-    the engine's vocabulary — in the Goals sheet's Goal_nature column, the
-    Picklists sheet, the 'Replenishing (pool)' action rows and the
-    'Replenishing Payouts' column header. This is a pure display pass over the
-    finished file: cell text and sheet names only, no numbers, no structure.
-    """
-    from openpyxl import load_workbook
-
-    wb = load_workbook(io.BytesIO(xlsx_bytes))
-    for ws in wb.worksheets:
-        for row in ws.iter_rows():
-            for cell in row:
-                if isinstance(cell.value, str):
-                    translated = _display_text(cell.value)
-                    if translated != cell.value:
-                        cell.value = translated
-        new_title = _display_text(ws.title)
-        if new_title != ws.title and new_title not in wb.sheetnames:
-            ws.title = new_title
-    buf = io.BytesIO()
-    wb.save(buf)
-    return buf.getvalue()
-
-
 # ── Load a downloaded inputs JSON back into the form ────────────────────────
 _TYPE_FROM_CRM = {v: k for k, v in _TYPE_TO_CRM.items()}
 _FREQ_FROM_CRM = {v: k for k, v in _FREQ_TO_CRM.items()}
@@ -543,12 +489,18 @@ def form_state_from_inputs(doc: dict):
         if end_mode not in GOAL_END_MODES:
             end_mode = "Occurrences"
         mode = g.get("start_date_mode")
+        # Structure: the file's value wins for Non-replenishing goals; files
+        # from the rename era (no structure key, or display-vocab nature) fall
+        # back on Lumpsum unless the goal is recurring by its fields.
+        structure = g.get("structure")
+        if structure not in GOAL_STRUCTURES:
+            structure = "Recurring" if (g.get("frequency") or (g.get("occurrences") or 1) > 1) else "Lumpsum"
         goals.append(normalise_goal({
             "name": str(g.get("name") or f"Goal {len(goals) + 1}"),
             "description": str(g.get("description") or ""),
             "type": gtype,
             "nature": nature,
-            "structure": "Recurring" if nature == "Replenishing" else "Lumpsum",
+            "structure": structure,
             "start_date_mode": mode if mode in GOAL_START_MODES else "Fixed",
             "start_date": ts(g.get("start_date"), add_years(today, 15)),
             "amount": int(float(g.get("amount") or 0)),
@@ -679,22 +631,25 @@ def render_goal(g: dict) -> None:
     g["name"] = r1c1.text_input("Name", value=g["name"], key=f"g_name_{uid}")
     g["description"] = r1c2.text_input("Description", value=g["description"], key=f"g_desc_{uid}")
 
-    r2c1, r2c2, _ = st.columns(3)
-    # The picker shows the advisor-facing words; the engine value is stored.
-    picked = r2c1.selectbox(
-        "Nature", [NATURE_DISPLAY[n] for n in GOAL_NATURES],
-        index=GOAL_NATURES.index(g["nature"]), key=f"g_nature_{uid}",
-        help="Lumpsum = a single one-time payout (provisioned via a glide path). "
-             "Recurring = multiple payouts over time (funded via the Debt/Hybrid pools).",
+    r2c1, r2c2, r2c3 = st.columns(3)
+    g["nature"] = r2c1.selectbox(
+        "Nature", GOAL_NATURES, index=GOAL_NATURES.index(g["nature"]),
+        key=f"g_nature_{uid}",
+        help="Replenishing = an ongoing payout stream (e.g. retirement income), "
+             "funded via the Debt/Hybrid pools — always Recurring. "
+             "Non-replenishing = a save-up goal provisioned via a glide path; "
+             "it can be a one-time Lumpsum or Recurring (e.g. annual fees).",
     )
-    g["nature"] = NATURE_FROM_DISPLAY[picked]
-    # Structure is derived from nature, never chosen. It is not displayed: after
-    # the rename it would repeat the Nature value word for word.
     if g["nature"] == "Replenishing":
         g["structure"] = "Recurring"
+        r2c2.caption("Structure: **Recurring** (always, for Replenishing)")
     else:
-        g["structure"] = "Lumpsum"
-        g["type"] = r2c2.selectbox(
+        g["structure"] = r2c2.selectbox(
+            "Structure", GOAL_STRUCTURES,
+            index=GOAL_STRUCTURES.index(g["structure"] if g["structure"] in GOAL_STRUCTURES else "Lumpsum"),
+            key=f"g_struct_{uid}",
+        )
+        g["type"] = r2c3.selectbox(
             "Type", GOAL_TYPES, index=GOAL_TYPES.index(g["type"]), key=f"g_type_{uid}",
             help="Selects the glide-path sheet used to provision this goal.",
         )
@@ -738,6 +693,9 @@ def render_goal(g: dict) -> None:
             g["end_date"] = month_year_input(
                 r5c3, "End date", g["end_date"] or g["start_date"], f"g_end_{uid}"
             )
+        if g["nature"] == "Non-replenishing":
+            st.caption("Non-replenishing recurring goals may span at most 4 years "
+                       "first-to-last payment (engine performance guard).")
 
 
 def render_one_time(w: dict) -> None:
@@ -824,10 +782,10 @@ def run_plan(config: dict) -> dict:
         )
         diag_result = {"success": False, "retirement_date": None, "failure": failure}
         try:
-            workbook = translate_workbook(build_advisor_workbook(
+            workbook = build_advisor_workbook(
                 config, diag_result, comprehensive_df=comp_df, snapshot=None,
                 goal_dfs=goal_dfs, pool_movements_df=pools_df,
-            ))
+            )
         except Exception:
             workbook = None  # degrade to no workbook rather than a dead screen
         return {
@@ -849,10 +807,10 @@ def run_plan(config: dict) -> dict:
     wealth = wealth_frame(comp_df, death_date)
     age_at_ret = float(config["current_age"]) + (retirement_date - current_date).days / 365.25
 
-    workbook = translate_workbook(build_advisor_workbook(
+    workbook = build_advisor_workbook(
         config, solved, comprehensive_df=comp_df, snapshot=snapshot,
         goal_dfs=goal_dfs, pool_movements_df=pools_df,
-    ))
+    )
     return {
         "kind": "success",
         "config": config,
@@ -869,9 +827,8 @@ def run_plan(config: dict) -> dict:
 # ── Results pane ────────────────────────────────────────────────────────────
 def render_results(out: dict) -> None:
     if out["kind"] == "invalid":
-        # Engine validation messages speak the engine's vocabulary.
         st.error("The plan inputs failed validation:\n\n" +
-                 "\n".join(f"- {_display_text(e)}" for e in out["errors"]))
+                 "\n".join(f"- {e}" for e in out["errors"]))
         return
 
     if out["kind"] == "infeasible":
@@ -881,7 +838,7 @@ def render_results(out: dict) -> None:
         if failure:
             st.warning(
                 f"First failure: **{fmt_mon_yyyy(failure.get('date'))}** — "
-                f"{_display_text(failure.get('description', 'Corpus depletion'))}"
+                f"{failure.get('description', 'Corpus depletion')}"
             )
         if not out["goal_table"].empty:
             st.dataframe(out["goal_table"], use_container_width=True, hide_index=True)
