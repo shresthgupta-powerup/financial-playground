@@ -577,8 +577,7 @@ def normalize_phone(raw: str) -> str | None:
 
 
 @st.cache_resource(show_spinner=False)
-def _versions_ws():
-    """The worksheet, or None when the feature is not configured."""
+def _cached_ws():
     try:
         creds = dict(st.secrets["gcp_service_account"])
         sheet_id = st.secrets["versions_sheet_id"]
@@ -593,6 +592,19 @@ def _versions_ws():
     except Exception as e:
         st.session_state.versions_error = str(e)
         return None
+
+
+def _versions_ws():
+    """The worksheet, or None when the feature is not configured.
+
+    Only successful connections stay cached: Streamlit Cloud applies new
+    secrets WITHOUT restarting the app, so a None cached at boot (before the
+    secrets existed) would otherwise stick until a manual reboot.
+    """
+    ws = _cached_ws()
+    if ws is None:
+        _cached_ws.clear()
+    return ws
 
 
 def versions_available() -> bool:
