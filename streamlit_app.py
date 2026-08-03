@@ -526,18 +526,9 @@ _PERSONAL_WIDGET_KEYS = (
 )
 
 
-def _apply_uploaded_inputs():
-    """st.button callback: load the uploaded JSON into the form."""
-    file = st.session_state.get("inputs_uploader")
-    if file is None:
-        st.session_state.upload_msg = ("error", "Choose a JSON file first.")
-        return
-    try:
-        doc = json.loads(file.getvalue().decode("utf-8"))
-        personal, streams, goals, one_time = form_state_from_inputs(doc)
-    except (ValueError, UnicodeDecodeError) as e:
-        st.session_state.upload_msg = ("error", f"Could not read that file: {e}")
-        return
+def _load_doc_into_form(doc: dict, source: str) -> None:
+    """Shared by the JSON uploader and the version picker: replace form state."""
+    personal, streams, goals, one_time = form_state_from_inputs(doc)
     for item in streams + goals + one_time:
         item["_uid"] = _next_uid()
     st.session_state.streams = streams
@@ -550,8 +541,119 @@ def _apply_uploaded_inputs():
     st.session_state.run_output = None
     st.session_state.upload_msg = (
         "success",
-        f"Loaded inputs for “{personal['client_name'] or 'plan'}” — review and press Run simulation.",
+        f"Loaded {source} for “{personal['client_name'] or 'plan'}” — review and press Run simulation.",
     )
+
+
+def _apply_uploaded_inputs():
+    """st.button callback: load the uploaded JSON into the form."""
+    file = st.session_state.get("inputs_uploader")
+    if file is None:
+        st.session_state.upload_msg = ("error", "Choose a JSON file first.")
+        return
+    try:
+        doc = json.loads(file.getvalue().decode("utf-8"))
+        _load_doc_into_form(doc, "inputs")
+    except (ValueError, UnicodeDecodeError) as e:
+        st.session_state.upload_msg = ("error", f"Could not read that file: {e}")
+
+
+# ── Version history (Google Sheet) ──────────────────────────────────────────
+# One spreadsheet row per simulation run, keyed by the client's phone number.
+# The stored payload is the same inputs JSON the download/upload feature uses,
+# so loading a version reuses the exact same restore path. The feature is
+# DORMANT until Streamlit secrets provide [gcp_service_account] and
+# versions_sheet_id — without them the UI hides and runs save nothing.
+VERSIONS_HEADER = ["phone", "client_name", "saved_at", "version", "note",
+                   "result", "inputs_json"]
+
+
+def normalize_phone(raw: str) -> str | None:
+    """Digits only; accept +91/0 prefixes by keeping the last 10 digits."""
+    digits = re.sub(r"\D", "", raw or "")
+    if len(digits) > 10:
+        digits = digits[-10:]
+    return digits if len(digits) == 10 else None
+
+
+@st.cache_resource(show_spinner=False)
+def _versions_ws():
+    """The worksheet, or None when the feature is not configured."""
+    try:
+        creds = dict(st.secrets["gcp_service_account"])
+        sheet_id = st.secrets["versions_sheet_id"]
+    except (KeyError, FileNotFoundError):
+        return None
+    try:
+        import gspread
+        ws = gspread.service_account_from_dict(creds).open_by_key(sheet_id).sheet1
+        if ws.row_values(1) != VERSIONS_HEADER:
+            ws.update(values=[VERSIONS_HEADER], range_name="A1")
+        return ws
+    except Exception as e:
+        st.session_state.versions_error = str(e)
+        return None
+
+
+def versions_available() -> bool:
+    return _versions_ws() is not None
+
+
+@st.cache_data(ttl=45, show_spinner=False)
+def fetch_versions(phone: str) -> list[dict]:
+    """All saved versions for a phone, newest first."""
+    ws = _versions_ws()
+    if ws is None:
+        return []
+    rows = [r for r in ws.get_all_records() if str(r.get("phone", "")) == phone]
+    return list(reversed(rows))
+
+
+def result_summary(out: dict) -> str:
+    if out["kind"] == "success":
+        return (f"Retire {fmt_mon_yyyy(out['retirement_date'])} "
+                f"(age {out['age_at_retirement']:.1f})")
+    if out["kind"] == "infeasible":
+        f = out.get("failure") or {}
+        when = fmt_mon_yyyy(f["date"]) if f.get("date") else "?"
+        return f"Infeasible — fails {when}"
+    return "Validation error"
+
+
+def save_version(phone: str, note: str, config: dict, out: dict) -> str | None:
+    """Append one row for this run; returns the version label, or None."""
+    ws = _versions_ws()
+    if ws is None:
+        return None
+    try:
+        version = f"v{len(fetch_versions(phone)) + 1}"
+        saved_at = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M")
+        ws.append_row(
+            [phone, config.get("client_name", ""), saved_at, version,
+             (note or "").strip(), result_summary(out),
+             build_inputs_json(config).decode("utf-8")],
+            value_input_option="RAW",
+        )
+        fetch_versions.clear()
+        return version
+    except Exception as e:
+        st.session_state.versions_error = str(e)
+        return None
+
+
+def _apply_selected_version():
+    """st.button callback: load the chosen saved version into the form."""
+    rows = st.session_state.get("_version_rows") or []
+    label = st.session_state.get("version_choice")
+    row = next((r for r in rows if r["_label"] == label), None)
+    if row is None:
+        st.session_state.upload_msg = ("error", "Pick a version first.")
+        return
+    try:
+        doc = json.loads(row["inputs_json"])
+        _load_doc_into_form(doc, row["_label"])
+    except (ValueError, KeyError) as e:
+        st.session_state.upload_msg = ("error", f"Could not load that version: {e}")
 
 
 # ── Widgets ─────────────────────────────────────────────────────────────────
@@ -959,6 +1061,41 @@ def main() -> None:
             "fixed pool returns: debt 6%, hybrid 10%."
         )
         st.divider()
+        st.header("Client versions")
+        phone_raw = st.text_input("Client phone number", key="p_phone",
+                                  placeholder="10-digit mobile",
+                                  help="Keys the saved-version history. Every Run "
+                                       "with a valid number saves a version.")
+        phone = normalize_phone(phone_raw)
+        note = ""
+        if phone_raw and phone is None:
+            st.caption(":red[Enter a 10-digit mobile number.]")
+        if versions_available():
+            if phone:
+                note = st.text_input("Note for next save (optional)", key="p_note",
+                                     placeholder="e.g. final shown to client")
+                rows = fetch_versions(phone)
+                for r in rows:
+                    bits = [str(r.get("version", "")), str(r.get("saved_at", ""))[5:],
+                            str(r.get("result", ""))]
+                    if r.get("note"):
+                        bits.append(str(r["note"]))
+                    r["_label"] = " · ".join(b for b in bits if b)
+                st.session_state._version_rows = rows
+                if rows:
+                    st.selectbox(f"{len(rows)} saved version(s)",
+                                 [r["_label"] for r in rows], key="version_choice")
+                    st.button("Load selected version", use_container_width=True,
+                              on_click=_apply_selected_version)
+                else:
+                    st.caption("No versions yet for this number — run a "
+                               "simulation to save the first one.")
+        else:
+            err = st.session_state.get("versions_error")
+            st.caption("Version history is not configured yet"
+                       + (f" (error: {err})" if err else "")
+                       + " — runs are not being saved.")
+        st.divider()
         with st.expander("📂 Load inputs JSON"):
             st.file_uploader(
                 "A financial_plan_inputs_*.json downloaded from this app",
@@ -1033,6 +1170,15 @@ def main() -> None:
         config = build_config(personal)
         with st.spinner("Solving for the earliest feasible retirement date…"):
             st.session_state.run_output = run_plan(config)
+        # Auto-save this run as a version when a valid phone number is set.
+        if phone and versions_available():
+            version = save_version(phone, note, config, st.session_state.run_output)
+            if version:
+                st.toast(f"Saved {version} for {phone}", icon="💾")
+            else:
+                st.warning("This run could not be saved to the version history"
+                           + (f": {st.session_state.get('versions_error')}"
+                              if st.session_state.get("versions_error") else "."))
 
     if st.session_state.run_output is not None:
         st.caption("Results reflect the inputs at the last Run — re-run after editing.")

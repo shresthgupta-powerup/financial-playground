@@ -7,4 +7,5 @@ python-dateutil>=2.9.0
 pydantic>=2.9.0          # only for code/app/planning/schemas.py
 openpyxl>=3.1.0          # advisor Excel export
 psycopg2-binary>=2.9.0   # import-time need of glide_paths_repo.py only (app-coupled, reference)
+gspread>=6.0.0           # client version history (Google Sheet store)
 pytest>=8.0.0            # to run code/tests (the executable spec)
