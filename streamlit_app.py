@@ -29,7 +29,12 @@ from app.planning import (
     run_simulation,
 )
 from app.planning.advisor_export import build_advisor_workbook
-from app.planning.engine import _DEFAULT_INSTRUMENT_PARAMS, _resolve_goals, format_inr
+from app.planning.engine import (
+    _DEFAULT_INSTRUMENT_PARAMS,
+    _resolve_goals,
+    expand_recurring_goal_to_tranches,
+    format_inr,
+)
 from app.planning.schemas import RISK_PROFILE_CORE_RETURNS
 
 # ── Picklists (mirror planForm.js) ──────────────────────────────────────────
@@ -558,6 +563,221 @@ def _apply_uploaded_inputs():
         st.session_state.upload_msg = ("error", f"Could not read that file: {e}")
 
 
+# ── Summary sheet (CM one-glance view) ──────────────────────────────────────
+# Inserted as the FIRST sheet of the engine's finished workbook — the engine's
+# own export code stays untouched. Any error here degrades to the original
+# workbook rather than breaking the download.
+
+def _goal_outflow_rows(config: dict, resolve_date, death_date) -> tuple[list, float]:
+    """Per-goal totals using the engine's own tranche expansion (engine-exact)."""
+    resolved = _resolve_goals(config.get("goals") or [], resolve_date, death_date)
+    rows, grand = [], 0.0
+    for g in resolved:
+        tranches = expand_recurring_goal_to_tranches(g, config["current_date"])
+        total = float(sum(fv for _d, fv in tranches))
+        first = min((d for d, _fv in tranches), default=g.get("start_date"))
+        fv_first = next((fv for d, fv in tranches if d == first), 0.0)
+        grand += total
+        rows.append({
+            "name": g.get("name", ""), "type": g.get("type", ""),
+            "nature": g.get("nature", ""), "structure": g.get("structure", ""),
+            "starts": fmt_mon_yyyy(first) if first is not None else "—",
+            "payments": len(tranches),
+            "pv": float(g.get("amount", 0) or 0),
+            "fv_first": fv_first,
+            "total_fv": total,
+        })
+    return rows, grand
+
+
+def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
+                      retirement_date=None, age_at_retirement=None, failure=None,
+                      comp_df=None, snapshot=None, death_date=None) -> bytes:
+    """Prepend a styled Summary sheet to the advisor workbook."""
+    try:
+        import io
+        from openpyxl import load_workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+        NAVY, GOLD = "16294B", "C9A227"
+        GREEN_BG, GREEN_TX = "E4F2E8", "1E6B3A"
+        RED_BG, RED_TX = "FAE6E4", "9C2B23"
+        GREY_BG = "F2F5F9"
+        thin = Side(style="thin", color="C9D1DC")
+        box = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+        wb = load_workbook(io.BytesIO(xlsx_bytes))
+        ws = wb.create_sheet("Summary", 0)
+        widths = {"A": 30, "B": 17, "C": 15, "D": 15, "E": 13, "F": 11,
+                  "G": 15, "H": 16, "I": 16}
+        for col, w in widths.items():
+            ws.column_dimensions[col].width = w
+
+        def put(cell, value, *, bold=False, size=11, color="1C2430", fill=None,
+                align="left", italic=False, border=False):
+            c = ws[cell]
+            c.value = value
+            c.font = Font(name="Calibri", bold=bold, size=size, color=color,
+                          italic=italic)
+            if fill:
+                c.fill = PatternFill("solid", start_color=fill)
+            c.alignment = Alignment(horizontal=align, vertical="center",
+                                    wrap_text=True)
+            if border:
+                c.border = box
+            return c
+
+        # Title + identity
+        ws.merge_cells("A1:I1")
+        put("A1", "FINANCIAL PLAN — SUMMARY", bold=True, size=16,
+            color="FFFFFF", fill=NAVY)
+        ws.row_dimensions[1].height = 26
+        ws.merge_cells("A2:I2")
+        ident = [config.get("client_name") or "—"]
+        if config.get("phone"):
+            ident.append(f"phone {config['phone']}")
+        ident += [
+            f"run {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%d %b %Y, %H:%M IST')}",
+            f"risk profile {config.get('risk_profile', 'Balanced')} "
+            f"({RISK_PROFILE_CORE_RETURNS.get(config.get('risk_profile'), 0.12) * 100:g}% core)",
+            f"engine {ENGINE_SOURCE_SHA}",
+        ]
+        put("A2", "   ·   ".join(ident), italic=True, size=9, color="5A6472")
+
+        # Verdict banner
+        ws.merge_cells("A4:I4")
+        ws.row_dimensions[4].height = 24
+        if kind == "success":
+            put("A4", f"FEASIBLE — earliest retirement {fmt_mon_yyyy(retirement_date)}"
+                      f" (age {age_at_retirement:.1f})",
+                bold=True, size=13, color=GREEN_TX, fill=GREEN_BG)
+        else:
+            f = failure or {}
+            when = fmt_mon_yyyy(f["date"]) if f.get("date") else "—"
+            put("A4", f"NOT FUNDABLE within the plan horizon — first failure "
+                      f"{when}: {f.get('description', 'corpus depletion')} "
+                      f"(diagnostic run at latest possible retirement)",
+                bold=True, size=12, color=RED_TX, fill=RED_BG)
+
+        # Key numbers
+        put("A6", "KEY NUMBERS", bold=True, color=NAVY, fill=GREY_BG)
+        ws.merge_cells("A6:I6")
+        current_date = pd.Timestamp(config["current_date"])
+        monthly_inv = sum(float(s.get("amount", 0) or 0)
+                          for s in config.get("investment_streams") or []
+                          if pd.Timestamp(s["start_date"]) <= current_date)
+        pairs = [("Current corpus", format_inr(config.get("current_corpus", 0))),
+                 ("Monthly investment today", format_inr(monthly_inv))]
+        totals = None
+        if comp_df is not None and not comp_df.empty:
+            df = comp_df.copy()
+            df["Date"] = pd.to_datetime(df["Date"])
+            vc = [c for c in df.columns if c.endswith("Value")]
+            totals = df[vc].fillna(0).sum(axis=1)
+            peak_i = totals.idxmax()
+            if kind == "success":
+                years = (pd.Timestamp(retirement_date) - current_date).days / 365.25
+                pairs.append(("Years to retirement", f"{years:.1f}"))
+                if snapshot:
+                    pairs.append(("Wealth at retirement", format_inr(snapshot["total"])))
+            pairs += [
+                ("Wealth at plan end", format_inr(float(totals.iloc[-1]))),
+                ("Peak wealth", f"{format_inr(float(totals.loc[peak_i]))}"
+                                f"  ({df['Date'].loc[peak_i].strftime('%b %Y')})"),
+            ]
+            if "Investment" in df.columns:
+                upto = (df["Date"] <= pd.Timestamp(retirement_date)) \
+                    if kind == "success" else pd.Series(True, index=df.index)
+                pairs.append(("Total investments (to retirement)"
+                              if kind == "success" else "Total investments (horizon)",
+                              format_inr(float(df.loc[upto, "Investment"].fillna(0).sum()))))
+        one_time_total = sum(float(w.get("amount", 0) or 0)
+                             for w in config.get("one_time_investments") or [])
+        if one_time_total:
+            pairs.append(("One-time investments", format_inr(one_time_total)))
+        r = 7
+        for i, (label, value) in enumerate(pairs):
+            col = "A" if i % 2 == 0 else "F"
+            vcol = "B" if i % 2 == 0 else "G"
+            put(f"{col}{r}", label, size=10, color="5A6472")
+            put(f"{vcol}{r}", value, bold=True, size=10)
+            if i % 2 == 1:
+                r += 1
+        if len(pairs) % 2 == 1:
+            r += 1
+
+        # Snapshot split (success only)
+        if kind == "success" and snapshot:
+            r += 1
+            put(f"A{r}", "WEALTH AT RETIREMENT — SPLIT", bold=True, color=NAVY,
+                fill=GREY_BG)
+            ws.merge_cells(f"A{r}:I{r}")
+            r += 1
+            for label, key in [("Core corpus", "core"), ("Debt pool", "debt"),
+                               ("Hybrid pool", "hybrid"),
+                               ("Goal tranches (debt)", "goal_debt"),
+                               ("Goal tranches (hybrid)", "goal_hybrid"),
+                               ("Total", "total")]:
+                put(f"A{r}", label, size=10,
+                    color="5A6472" if key != "total" else "1C2430",
+                    bold=(key == "total"))
+                put(f"B{r}", format_inr(snapshot[key]), bold=(key == "total"), size=10)
+                r += 1
+
+        # Goals table
+        r += 1
+        put(f"A{r}", "GOALS", bold=True, color=NAVY, fill=GREY_BG)
+        ws.merge_cells(f"A{r}:I{r}")
+        r += 1
+        resolve_date = pd.Timestamp(retirement_date) if kind == "success" \
+            else pd.Timestamp(death_date)
+        goal_rows, grand = _goal_outflow_rows(config, resolve_date, death_date)
+        headers = ["Goal", "Type", "Nature", "Structure", "Starts", "Payments",
+                   "Amount (today's ₹)", "Cost at start (FV)", "Total outflow (FV)"]
+        for j, h in enumerate(headers):
+            put(f"{chr(65 + j)}{r}", h, bold=True, size=9, color="FFFFFF",
+                fill=NAVY, border=True)
+        r += 1
+        for g in goal_rows:
+            vals = [g["name"], g["type"], g["nature"], g["structure"], g["starts"],
+                    g["payments"], format_inr(g["pv"]), format_inr(g["fv_first"]),
+                    format_inr(g["total_fv"])]
+            for j, v in enumerate(vals):
+                put(f"{chr(65 + j)}{r}", v, size=9, border=True,
+                    align="right" if j >= 5 else "left")
+            r += 1
+        put(f"A{r}", "TOTAL", bold=True, size=9, border=True)
+        for j in range(1, 8):
+            put(f"{chr(65 + j)}{r}", "", border=True)
+        put(f"I{r}", format_inr(grand), bold=True, size=9, border=True, align="right")
+        r += 2
+
+        # Money in vs money out
+        put(f"A{r}", "MONEY IN vs MONEY OUT (full horizon, future value)",
+            bold=True, color=NAVY, fill=GREY_BG)
+        ws.merge_cells(f"A{r}:I{r}")
+        r += 1
+        if comp_df is not None and not comp_df.empty and "Investment" in comp_df.columns:
+            inv_total = float(comp_df["Investment"].fillna(0).sum())
+            put(f"A{r}", "Total investment inflows", size=10, color="5A6472")
+            put(f"B{r}", format_inr(inv_total + one_time_total), bold=True, size=10)
+            r += 1
+        put(f"A{r}", "Total goal outflows", size=10, color="5A6472")
+        put(f"B{r}", format_inr(grand), bold=True, size=10)
+        r += 2
+        put(f"A{r}", "Amounts are engine-computed: goal costs grown from today's "
+                     "value at each goal's growth %; every figure matches the "
+                     "detailed sheets that follow.",
+            italic=True, size=8, color="5A6472")
+        ws.merge_cells(f"A{r}:I{r}")
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+    except Exception:
+        return xlsx_bytes  # never break the download over a summary problem
+
+
 # ── Version history (Google Sheet) ──────────────────────────────────────────
 # One spreadsheet row per simulation run, keyed by the client's phone number.
 # The stored payload is the same inputs JSON the download/upload feature uses,
@@ -866,9 +1086,10 @@ def build_config(personal: dict) -> dict:
         "target_lifetime": float(personal["target_lifetime"]),
         "current_corpus": float(personal["current_corpus"]),
         "risk_profile": personal["risk_profile"],
-        # Read only by the Excel export headers — the engine ignores both.
+        # Read only by the Excel export headers — the engine ignores these.
         "client_name": personal["client_name"] or "Playground",
         "m3_id": "playground",
+        "phone": personal.get("phone") or "",
         "investment_streams": streams,
         "goals": goals,
         "one_time_investments": one_time,
@@ -904,6 +1125,10 @@ def run_plan(config: dict) -> dict:
                 config, diag_result, comprehensive_df=comp_df, snapshot=None,
                 goal_dfs=goal_dfs, pool_movements_df=pools_df,
             )
+            workbook = add_summary_sheet(
+                workbook, config, kind="infeasible", failure=failure,
+                comp_df=comp_df, death_date=death_date,
+            )
         except Exception:
             workbook = None  # degrade to no workbook rather than a dead screen
         return {
@@ -928,6 +1153,11 @@ def run_plan(config: dict) -> dict:
     workbook = build_advisor_workbook(
         config, solved, comprehensive_df=comp_df, snapshot=snapshot,
         goal_dfs=goal_dfs, pool_movements_df=pools_df,
+    )
+    workbook = add_summary_sheet(
+        workbook, config, kind="success", retirement_date=retirement_date,
+        age_at_retirement=age_at_ret, comp_df=comp_df, snapshot=snapshot,
+        death_date=death_date,
     )
     return {
         "kind": "success",
@@ -1126,6 +1356,7 @@ def main() -> None:
         "target_lifetime": target_lifetime,
         "current_corpus": current_corpus,
         "risk_profile": risk_profile,
+        "phone": phone,
     }
 
     left, right = st.columns([1, 1], gap="large")
