@@ -13,6 +13,7 @@ import copy
 import json
 import re
 import sys
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "code"))
@@ -285,6 +286,12 @@ def csv_with_summary(comprehensive_df: pd.DataFrame) -> bytes:
     return out.to_csv(index=False).encode("utf-8")
 
 
+def new_simulation_id() -> str:
+    """Readable, sortable, unique: SIM-<IST timestamp>-<random suffix>."""
+    stamp = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y%m%d-%H%M%S")
+    return f"SIM-{stamp}-{uuid.uuid4().hex[:6]}"
+
+
 def inputs_filename(config: dict) -> str:
     """Unique, human-sortable filename: client + timestamp, filesystem-safe."""
     raw = (config.get("client_name") or "plan").strip() or "plan"
@@ -389,6 +396,7 @@ def build_inputs_json(config: dict, retirement_date=None) -> bytes:
         goals_out = [_crm_goal(g, resolved=False) for g in goals_in]
     doc = {
         "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "simulation_id": config.get("simulation_id", ""),
         "engine_version": ENGINE_SOURCE_SHA,
         "glidepath_version": GLIDEPATH_VERSION,
         "personal": {
@@ -642,6 +650,8 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
             f"({RISK_PROFILE_CORE_RETURNS.get(config.get('risk_profile'), 0.12) * 100:g}% core)",
             f"engine {ENGINE_SOURCE_SHA}",
         ]
+        if config.get("simulation_id"):
+            ident.append(config["simulation_id"])
         put("A2", "   ·   ".join(ident), italic=True, size=9, color="5A6472")
 
         # Verdict banner
@@ -784,8 +794,11 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
 # so loading a version reuses the exact same restore path. The feature is
 # DORMANT until Streamlit secrets provide [gcp_service_account] and
 # versions_sheet_id — without them the UI hides and runs save nothing.
+# sim_id/output_json were added 2026-08-25 and sit at the END on purpose:
+# the header row auto-migrates in place, and appending columns keeps every
+# pre-existing row aligned (older rows simply have the two cells empty).
 VERSIONS_HEADER = ["phone", "client_name", "saved_at", "version", "note",
-                   "result", "inputs_json"]
+                   "result", "inputs_json", "sim_id", "output_json"]
 
 
 def normalize_phone(raw: str) -> str | None:
@@ -863,7 +876,9 @@ def save_version(phone: str, note: str, config: dict, out: dict) -> str | None:
         ws.append_row(
             [phone, config.get("client_name", ""), saved_at, version,
              (note or "").strip(), result_summary(out),
-             build_inputs_json(config).decode("utf-8")],
+             build_inputs_json(config).decode("utf-8"),
+             config.get("simulation_id", ""),
+             build_output_json(config, out).decode("utf-8")],
             value_input_option="RAW",
         )
         fetch_versions.clear()
@@ -1096,8 +1111,51 @@ def build_config(personal: dict) -> dict:
     }
 
 
+def build_output_json(config: dict, out: dict) -> bytes:
+    """Compact result record for the simulation log (pairs with the inputs JSON).
+
+    Deliberately headline-level — verdict, dates, snapshot, key wealth figures,
+    failure/validation detail — not the monthly ledger (which lives in the
+    CSV/Excel and would not fit a sheet cell).
+    """
+    doc = {
+        "simulation_id": config.get("simulation_id", ""),
+        "generated_at": pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d %H:%M:%S"),
+        "engine_version": ENGINE_SOURCE_SHA,
+        "glidepath_version": GLIDEPATH_VERSION,
+        "client_name": config.get("client_name", ""),
+        "phone": config.get("phone", ""),
+        "risk_profile": config.get("risk_profile", ""),
+        "verdict": out["kind"],
+    }
+    if out["kind"] == "success":
+        wealth = out.get("wealth")
+        doc.update({
+            "retirement_date": _iso_or_none(out["retirement_date"]),
+            "age_at_retirement": round(out["age_at_retirement"], 1),
+            "snapshot_at_retirement": out.get("snapshot"),
+        })
+        if wealth is not None and not wealth.empty:
+            total = wealth["Total wealth"]
+            doc["wealth_at_plan_end"] = round(float(total.iloc[-1]), 2)
+            doc["peak_wealth"] = {
+                "amount": round(float(total.max()), 2),
+                "date": total.idxmax().strftime("%Y-%m-01"),
+            }
+    elif out["kind"] == "infeasible":
+        f = out.get("failure") or {}
+        doc["failure"] = {
+            "date": _iso_or_none(f.get("date")),
+            "description": str(f.get("description", "Corpus depletion")),
+        }
+    else:
+        doc["validation_errors"] = list(out.get("errors") or [])
+    return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8")
+
+
 def run_plan(config: dict) -> dict:
     """Solve + simulate; returns everything the results pane needs."""
+    config["simulation_id"] = new_simulation_id()
     instrument_params = resolve_instrument_params(config["risk_profile"])
     glide_paths = get_glide_paths()
     current_date = pd.Timestamp(config["current_date"])
@@ -1424,8 +1482,11 @@ def main() -> None:
                               if st.session_state.get("versions_error") else "."))
 
     if st.session_state.run_output is not None:
-        st.caption("Results reflect the inputs at the last Run — re-run after editing.")
-        render_results(st.session_state.run_output)
+        out = st.session_state.run_output
+        sim_id = (out.get("config") or {}).get("simulation_id", "")
+        st.caption("Results reflect the inputs at the last Run — re-run after editing."
+                   + (f"  ·  {sim_id}" if sim_id else ""))
+        render_results(out)
 
 
 if __name__ == "__main__":
