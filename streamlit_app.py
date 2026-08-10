@@ -561,14 +561,13 @@ def form_state_from_inputs(doc: dict):
     return personal, streams, goals, one_time
 
 
-_PERSONAL_WIDGET_KEYS = (
-    "p_client", "p_curdate_m", "p_curdate_y", "p_age", "p_life", "p_corpus", "p_risk",
-    "p_mode", "p_target_m", "p_target_y", "p_phone",
-)
-
-
 def _load_doc_into_form(doc: dict, source: str) -> None:
-    """Shared by the JSON uploader and the version picker: replace form state."""
+    """Shared by the JSON uploader and the version picker: replace form state.
+
+    Personal widgets are set DIRECTLY via their session-state keys — the
+    documented way to change a keyed widget programmatically. The widgets
+    themselves carry no defaults, so nothing competes with these values.
+    """
     personal, streams, goals, one_time = form_state_from_inputs(doc)
     if not personal.get("phone"):
         # Files from before phone was stored: keep whatever is typed now.
@@ -579,9 +578,21 @@ def _load_doc_into_form(doc: dict, source: str) -> None:
     st.session_state.goals = goals
     st.session_state.one_time = one_time
     st.session_state.personal_defaults = personal
-    # Personal widgets re-initialise from the new defaults on the next render.
-    for key in _PERSONAL_WIDGET_KEYS:
-        st.session_state.pop(key, None)
+    st.session_state["p_client"] = personal["client_name"]
+    cd = personal["current_date"]
+    st.session_state["p_curdate_m"] = MONTH_NAMES[cd.month - 1]
+    st.session_state["p_curdate_y"] = int(cd.year)
+    st.session_state["p_age"] = int(personal["current_age"])
+    st.session_state["p_life"] = int(personal["target_lifetime"])
+    st.session_state["p_corpus"] = int(personal["current_corpus"])
+    st.session_state["p_risk"] = personal["risk_profile"]
+    st.session_state["p_mode"] = ("Earliest possible"
+                                  if personal["retirement_mode"] == "earliest"
+                                  else "At a chosen date")
+    td = personal["target_date"]
+    st.session_state["p_target_m"] = MONTH_NAMES[td.month - 1]
+    st.session_state["p_target_y"] = int(td.year)
+    st.session_state["p_phone"] = personal.get("phone", "")
     st.session_state.run_output = None
     st.session_state.upload_msg = (
         "success",
@@ -989,18 +1000,27 @@ def _apply_selected_version():
 
 # ── Widgets ─────────────────────────────────────────────────────────────────
 def month_year_input(container, label: str, ts, key: str) -> pd.Timestamp:
-    """Month + year picker (the engine's grid is monthly — day is always the 1st)."""
+    """Month + year picker (the engine's grid is monthly — day is always the 1st).
+
+    When the widget keys already exist in session_state (seeded at init or set
+    programmatically on load), no defaults are passed — the state alone drives
+    the widget. Passing a default alongside API-set state is the pattern that
+    let real browsers resurrect stale values after a version load.
+    """
     ts = pd.Timestamp(ts) if ts is not None else month_start_today()
     c1, c2 = container.columns([3, 2])
-    month = c1.selectbox(f"{label} — month", MONTH_NAMES, index=ts.month - 1, key=f"{key}_m")
+    mkw = {} if f"{key}_m" in st.session_state else {"index": ts.month - 1}
+    ykw = {} if f"{key}_y" in st.session_state else {"value": int(ts.year)}
+    month = c1.selectbox(f"{label} — month", MONTH_NAMES, key=f"{key}_m", **mkw)
     year = c2.number_input(f"{label} — year", min_value=1950, max_value=2150,
-                           value=int(ts.year), step=1, key=f"{key}_y")
+                           step=1, key=f"{key}_y", **ykw)
     return pd.Timestamp(int(year), MONTH_NAMES.index(month) + 1, 1)
 
 
 def money_input(container, label: str, value, key: str, help: str | None = None) -> int:
-    amt = container.number_input(label, min_value=0, value=int(value), step=50_000,
-                                 key=key, help=help)
+    vkw = {} if key in st.session_state else {"value": int(value)}
+    amt = container.number_input(label, min_value=0, step=50_000,
+                                 key=key, help=help, **vkw)
     container.caption(inr_hint(amt))
     return amt
 
@@ -1033,6 +1053,22 @@ def init_state() -> None:
         "target_date": add_years(today, 25),
         "phone": "",
     }
+    # Personal widgets are STATE-DRIVEN: keys seeded here, set directly on
+    # version/file load, and the widgets carry no value=/index= defaults.
+    # (The old pop-and-default pattern let real browsers resurrect stale
+    # widget values after a load.)
+    st.session_state.setdefault("p_client", "")
+    st.session_state.setdefault("p_curdate_m", MONTH_NAMES[today.month - 1])
+    st.session_state.setdefault("p_curdate_y", int(today.year))
+    st.session_state.setdefault("p_age", 30)
+    st.session_state.setdefault("p_life", 90)
+    st.session_state.setdefault("p_corpus", 10_000_000)
+    st.session_state.setdefault("p_risk", "Balanced")
+    st.session_state.setdefault("p_mode", "Earliest possible")
+    _tgt = add_years(today, 25)
+    st.session_state.setdefault("p_target_m", MONTH_NAMES[_tgt.month - 1])
+    st.session_state.setdefault("p_target_y", int(_tgt.year))
+    st.session_state.setdefault("p_phone", "")
 
 
 # ── Form sections ───────────────────────────────────────────────────────────
@@ -1688,17 +1724,15 @@ def main() -> None:
     d = st.session_state.personal_defaults
     with st.sidebar:
         st.header("Personal & Corpus")
-        client_name = st.text_input("Client name (Excel header only)",
-                                    value=d["client_name"], key="p_client")
+        client_name = st.text_input("Client name (Excel header only)", key="p_client")
         current_date = month_year_input(st, "Plan start", d["current_date"], "p_curdate")
         c1, c2 = st.columns(2)
         current_age = c1.number_input("Current age", min_value=0, max_value=110,
-                                      value=int(d["current_age"]), step=1, key="p_age")
+                                      step=1, key="p_age")
         target_lifetime = c2.number_input("Target lifetime", min_value=1, max_value=120,
-                                          value=int(d["target_lifetime"]), step=1, key="p_life")
+                                          step=1, key="p_life")
         current_corpus = money_input(st, "Current corpus (₹)", d["current_corpus"], "p_corpus")
-        risk_profile = st.selectbox("Risk profile", RISK_PROFILES,
-                                    index=RISK_PROFILES.index(d["risk_profile"]), key="p_risk")
+        risk_profile = st.selectbox("Risk profile", RISK_PROFILES, key="p_risk")
         st.caption(
             f"Core-corpus return the engine will use: "
             f"**{RISK_PROFILE_CORE_RETURNS[risk_profile] * 100:g}%** · "
@@ -1711,7 +1745,6 @@ def main() -> None:
         _mode_labels = {"earliest": "Earliest possible", "target_age": "At a chosen date"}
         mode_label = st.radio(
             "Retirement date", list(_mode_labels.values()),
-            index=0 if d.get("retirement_mode", "earliest") == "earliest" else 1,
             key="p_mode", horizontal=True,
             help="Earliest possible = the solver finds the first feasible month. "
                  "At a chosen date = test that month; if it is not fundable, the "
@@ -1734,7 +1767,6 @@ def main() -> None:
         st.divider()
         st.header("Client versions")
         phone_raw = st.text_input("Client phone number", key="p_phone",
-                                  value=d.get("phone", ""),
                                   placeholder="10-digit mobile",
                                   help="Keys the saved-version history. Every Run "
                                        "with a valid number saves a version.")
