@@ -399,8 +399,12 @@ def build_inputs_json(config: dict, retirement_date=None) -> bytes:
         "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         "simulation_id": config.get("simulation_id", ""),
         "retirement_mode": config.get("retirement_mode", "earliest"),
-        "target_age": config.get("target_age")
+        # target_date is authoritative; target_age is derived, for readability.
+        "target_date": _iso_or_none(config.get("target_date"))
         if config.get("retirement_mode") == "target_age" else None,
+        "target_age": round(target_age_of(config, target_retirement_date(config)), 1)
+        if config.get("retirement_mode") == "target_age" and config.get("target_date")
+        else None,
         "engine_version": ENGINE_SOURCE_SHA,
         "glidepath_version": GLIDEPATH_VERSION,
         "personal": {
@@ -469,15 +473,22 @@ def form_state_from_inputs(doc: dict):
     p = doc.get("personal") or {}
     risk = p.get("risk_profile")
     mode = doc.get("retirement_mode")
+    current_date = ts(p.get("current_date"), today)
+    current_age = int(float(p.get("current_age") or 30))
+    # target_date preferred; age-era files (pre 2026-08-26) carry target_age.
+    target_date = ts(doc.get("target_date"))
+    if target_date is None and doc.get("target_age") is not None:
+        years = int(round(float(doc["target_age"]) - current_age))
+        target_date = add_years(current_date, max(years, 1))
     personal = {
         "client_name": str(p.get("client_name") or ""),
-        "current_date": ts(p.get("current_date"), today),
-        "current_age": int(float(p.get("current_age") or 30)),
+        "current_date": current_date,
+        "current_age": current_age,
         "target_lifetime": int(float(p.get("target_lifetime") or 90)),
         "current_corpus": int(float(p.get("current_corpus") or 0)),
         "risk_profile": risk if risk in RISK_PROFILES else "Balanced",
         "retirement_mode": mode if mode in ("earliest", "target_age") else "earliest",
-        "target_age": int(float(doc.get("target_age") or 55)),
+        "target_date": target_date or add_years(current_date, 25),
     }
 
     streams = []
@@ -543,7 +554,7 @@ def form_state_from_inputs(doc: dict):
 
 _PERSONAL_WIDGET_KEYS = (
     "p_client", "p_curdate_m", "p_curdate_y", "p_age", "p_life", "p_corpus", "p_risk",
-    "p_mode", "p_target_age",
+    "p_mode", "p_target_m", "p_target_y",
 )
 
 
@@ -670,8 +681,8 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
         if kind == "success" and mi.get("target_age") is not None:
             extra = (f"  ·  earliest possible: {fmt_mon_yyyy(mi['earliest'])}"
                      if mi.get("earliest") is not None else "")
-            put("A4", f"FEASIBLE at chosen age {mi['target_age']:.0f} "
-                      f"({fmt_mon_yyyy(retirement_date)}){extra}",
+            put("A4", f"FEASIBLE at chosen date {fmt_mon_yyyy(retirement_date)} "
+                      f"(age {mi['target_age']:.1f}){extra}",
                 bold=True, size=13, color=GREEN_TX, fill=GREEN_BG)
         elif kind == "success":
             put("A4", f"FEASIBLE — earliest retirement {fmt_mon_yyyy(retirement_date)}"
@@ -681,13 +692,13 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
             sip = mi.get("sip_needed")
             if sip:
                 now = mi.get("monthly_now", 0)
-                msg = (f"NOT FUNDABLE at age {mi['target_age']:.0f} "
-                       f"({fmt_mon_yyyy(mi['chosen'])}) — additional SIP needed: "
+                msg = (f"NOT FUNDABLE at {fmt_mon_yyyy(mi['chosen'])} "
+                       f"(age {mi['target_age']:.1f}) — additional SIP needed: "
                        f"{format_inr(sip)}/month (raise {format_inr(now)} → "
                        f"{format_inr(now + sip)})")
             else:
-                msg = (f"NOT FUNDABLE at age {mi['target_age']:.0f} "
-                       f"({fmt_mon_yyyy(mi['chosen'])}) — not achievable by extra "
+                msg = (f"NOT FUNDABLE at {fmt_mon_yyyy(mi['chosen'])} "
+                       f"(age {mi['target_age']:.1f}) — not achievable by extra "
                        f"SIP alone; revisit goal amounts or dates")
             if mi.get("earliest") is not None:
                 msg += f"  ·  current plan supports {fmt_mon_yyyy(mi['earliest'])}"
@@ -892,15 +903,16 @@ def fetch_versions(phone: str) -> list[dict]:
 def result_summary(out: dict) -> str:
     if out["kind"] == "success":
         if out.get("target_age") is not None:
-            return (f"Age {out['target_age']:.0f} "
-                    f"({fmt_mon_yyyy(out['retirement_date'])}): feasible")
+            return (f"{fmt_mon_yyyy(out['retirement_date'])} "
+                    f"(age {out['target_age']:.1f}): feasible")
         return (f"Retire {fmt_mon_yyyy(out['retirement_date'])} "
                 f"(age {out['age_at_retirement']:.1f})")
     if out["kind"] == "target_infeasible":
         sip = out.get("sip_needed")
         if sip:
-            return f"Age {out['target_age']:.0f}: needs +{format_inr(sip)}/mo"
-        return f"Age {out['target_age']:.0f}: not achievable via SIP"
+            return (f"{fmt_mon_yyyy(out['chosen_date'])}: "
+                    f"needs +{format_inr(sip)}/mo")
+        return f"{fmt_mon_yyyy(out['chosen_date'])}: not achievable via SIP"
     if out["kind"] == "infeasible":
         f = out.get("failure") or {}
         when = fmt_mon_yyyy(f["date"]) if f.get("date") else "?"
@@ -1006,7 +1018,7 @@ def init_state() -> None:
         "current_corpus": 10_000_000,
         "risk_profile": "Balanced",
         "retirement_mode": "earliest",
-        "target_age": 55,
+        "target_date": add_years(today, 25),
     }
 
 
@@ -1168,7 +1180,7 @@ def build_config(personal: dict) -> dict:
         "m3_id": "playground",
         "phone": personal.get("phone") or "",
         "retirement_mode": personal.get("retirement_mode") or "earliest",
-        "target_age": personal.get("target_age"),
+        "target_date": personal.get("target_date"),
         "investment_streams": streams,
         "goals": goals,
         "one_time_investments": one_time,
@@ -1246,10 +1258,15 @@ SIP_ROUND_TO = 500              # present a clean, verified number
 
 
 def target_retirement_date(config: dict) -> pd.Timestamp:
-    """Chosen age → month-grid date: current_date + (target_age − current_age) years."""
+    """The chosen retirement month, snapped to the month grid."""
+    t = pd.Timestamp(config["target_date"])
+    return pd.Timestamp(t.year, t.month, 1)
+
+
+def target_age_of(config: dict, chosen: pd.Timestamp) -> float:
+    """Derived age at the chosen date (input is a month/year since 2026-08-26)."""
     current = pd.Timestamp(config["current_date"])
-    years = int(round(float(config["target_age"]) - float(config["current_age"])))
-    return pd.Timestamp(current.year + years, current.month, 1)
+    return float(config["current_age"]) + (chosen - current).days / 365.25
 
 
 def _extra_sip_stream(config: dict, amount: float) -> dict:
@@ -1323,7 +1340,12 @@ def run_plan_target(config: dict, progress=None) -> dict:
         return {"kind": "invalid", "errors": list(e.errors), "config": config}
 
     chosen = target_retirement_date(config)
-    target_age = float(config["target_age"])
+    if not (current_date < chosen < death_date):
+        return {"kind": "invalid", "config": config, "errors": [
+            f"Chosen retirement month {fmt_mon_yyyy(chosen)} must be after the "
+            f"plan start ({fmt_mon_yyyy(current_date)}) and before the plan end "
+            f"({fmt_mon_yyyy(death_date)})."]}
+    target_age = target_age_of(config, chosen)
 
     # Context both branches want: the earliest date the CURRENT plan supports.
     solved = find_retirement_date(config, instrument_params, glide_paths)
@@ -1520,7 +1542,7 @@ def render_results(out: dict) -> None:
         age = out["target_age"]
         chosen = out["chosen_date"]
         sip = out.get("sip_needed")
-        st.error(f"Retiring at age **{age:.0f}** ({fmt_mon_yyyy(chosen)}) is "
+        st.error(f"Retiring in **{fmt_mon_yyyy(chosen)}** (age {age:.1f}) is "
                  "**not fundable** with the current plan.")
         if sip:
             now = out.get("monthly_now", 0)
@@ -1532,8 +1554,8 @@ def render_results(out: dict) -> None:
                       if out.get("earliest_date") is not None else "no age")
             st.caption(
                 f"A flat additional SIP of **{format_inr(sip)}/month** (no step-up, "
-                f"starting now, until retirement) makes age {age:.0f} feasible — "
-                "verified by a full simulation at exactly that amount."
+                f"starting now, until retirement) makes {fmt_mon_yyyy(chosen)} "
+                "feasible — verified by a full simulation at exactly that amount."
             )
             st.button(
                 f"➕ Apply +{format_inr(sip)}/month to the form",
@@ -1585,8 +1607,8 @@ def render_results(out: dict) -> None:
     if out.get("target_age") is not None:
         extra = (f" · earliest possible: **{fmt_mon_yyyy(out['earliest_date'])}**"
                  if out.get("earliest_date") is not None else "")
-        st.success(f"Retiring at age **{out['target_age']:.0f}** "
-                   f"({fmt_mon_yyyy(ret)}) is **feasible**{extra}")
+        st.success(f"Retiring in **{fmt_mon_yyyy(ret)}** "
+                   f"(age {out['target_age']:.1f}) is **feasible**{extra}")
     else:
         st.success(f"Earliest feasible retirement: **{fmt_mon_yyyy(ret)}** "
                    f"(age {out['age_at_retirement']:.1f})")
@@ -1671,28 +1693,31 @@ def main() -> None:
         )
         st.divider()
         st.header("Retirement")
-        _mode_labels = {"earliest": "Earliest possible", "target_age": "At a chosen age"}
+        # Internal mode value stays "target_age" for saved-file compatibility;
+        # the input is a month/year since 2026-08-26 (age shows as a caption).
+        _mode_labels = {"earliest": "Earliest possible", "target_age": "At a chosen date"}
         mode_label = st.radio(
             "Retirement date", list(_mode_labels.values()),
             index=0 if d.get("retirement_mode", "earliest") == "earliest" else 1,
             key="p_mode", horizontal=True,
             help="Earliest possible = the solver finds the first feasible month. "
-                 "At a chosen age = test that age; if it is not fundable, the app "
-                 "computes the additional SIP needed.",
+                 "At a chosen date = test that month; if it is not fundable, the "
+                 "app computes the additional SIP needed.",
         )
         retirement_mode = "earliest" if mode_label == _mode_labels["earliest"] else "target_age"
-        target_age = None
+        target_date = None
         if retirement_mode == "target_age":
-            target_age = st.number_input(
-                "Retire at age", min_value=int(current_age),
-                max_value=max(int(current_age), int(target_lifetime) - 1),
-                value=min(max(int(d.get("target_age", 55)), int(current_age)),
-                          max(int(current_age), int(target_lifetime) - 1)),
-                step=1, key="p_target_age",
+            target_date = month_year_input(
+                st, "Retire in", d.get("target_date") or add_years(current_date, 25),
+                "p_target",
             )
-            _td = pd.Timestamp(current_date.year + (int(target_age) - int(current_age)),
-                               current_date.month, 1)
-            st.caption(f"Age {int(target_age)} = **{fmt_mon_yyyy(_td)}**")
+            _yrs = (target_date - current_date).days / 365.25
+            if target_date <= current_date:
+                st.caption(":red[Pick a month after the plan start.]")
+            elif current_age + _yrs >= target_lifetime:
+                st.caption(":red[That is at or beyond the target lifetime.]")
+            else:
+                st.caption(f"= age **{current_age + _yrs:.1f}**")
         st.divider()
         st.header("Client versions")
         phone_raw = st.text_input("Client phone number", key="p_phone",
@@ -1749,7 +1774,7 @@ def main() -> None:
         "risk_profile": risk_profile,
         "phone": phone,
         "retirement_mode": retirement_mode,
-        "target_age": target_age,
+        "target_date": target_date,
     }
 
     left, right = st.columns([1, 1], gap="large")
