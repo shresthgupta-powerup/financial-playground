@@ -409,6 +409,7 @@ def build_inputs_json(config: dict, retirement_date=None) -> bytes:
         "glidepath_version": GLIDEPATH_VERSION,
         "personal": {
             "client_name": config.get("client_name", ""),
+            "phone": config.get("phone", ""),
             "current_date": _iso_or_none(config.get("current_date")),
             "current_age": config.get("current_age"),
             "target_lifetime": config.get("target_lifetime"),
@@ -470,11 +471,18 @@ def form_state_from_inputs(doc: dict):
         except (ValueError, TypeError):
             return fallback
 
+    def num(v, default):
+        """Numeric with an explicit None/empty check — NEVER `or`, which would
+        turn a legitimate stored 0 into the default (the inflation-0 bug)."""
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+
     p = doc.get("personal") or {}
     risk = p.get("risk_profile")
     mode = doc.get("retirement_mode")
     current_date = ts(p.get("current_date"), today)
-    current_age = int(float(p.get("current_age") or 30))
+    current_age = int(num(p.get("current_age"), 30))
     # target_date preferred; age-era files (pre 2026-08-26) carry target_age.
     target_date = ts(doc.get("target_date"))
     if target_date is None and doc.get("target_age") is not None:
@@ -484,11 +492,12 @@ def form_state_from_inputs(doc: dict):
         "client_name": str(p.get("client_name") or ""),
         "current_date": current_date,
         "current_age": current_age,
-        "target_lifetime": int(float(p.get("target_lifetime") or 90)),
-        "current_corpus": int(float(p.get("current_corpus") or 0)),
+        "target_lifetime": int(num(p.get("target_lifetime"), 90)),
+        "current_corpus": int(num(p.get("current_corpus"), 0)),
         "risk_profile": risk if risk in RISK_PROFILES else "Balanced",
         "retirement_mode": mode if mode in ("earliest", "target_age") else "earliest",
         "target_date": target_date or add_years(current_date, 25),
+        "phone": normalize_phone(str(p.get("phone") or "")) or "",
     }
 
     streams = []
@@ -501,7 +510,7 @@ def form_state_from_inputs(doc: dict):
             "start_date": start,
             "end_date_mode": mode if mode in INVESTMENT_END_MODES else "At retirement",
             "end_date": ts(s.get("end_date"), add_years(start, 20)),
-            "step_up_percent": float(s.get("step_up_percent") or 0.0),
+            "step_up_percent": num(s.get("step_up_percent"), 0.0),
             "step_up_frequency": s.get("step_up_frequency")
             if s.get("step_up_frequency") in STEPUP_FREQUENCIES else "Annual",
             "step_up_date": ts(s.get("step_up_date"), start),
@@ -539,7 +548,7 @@ def form_state_from_inputs(doc: dict):
             "occurrences": int(float(g.get("occurrences") or 1)),
             "end_mode": end_mode,
             "end_date": ts(g.get("end_date")),
-            "inflation_percent": float(g.get("inflation_percent") or 6.0),
+            "inflation_percent": num(g.get("inflation_percent"), 6.0),
         }))
 
     one_time = []
@@ -554,13 +563,16 @@ def form_state_from_inputs(doc: dict):
 
 _PERSONAL_WIDGET_KEYS = (
     "p_client", "p_curdate_m", "p_curdate_y", "p_age", "p_life", "p_corpus", "p_risk",
-    "p_mode", "p_target_m", "p_target_y",
+    "p_mode", "p_target_m", "p_target_y", "p_phone",
 )
 
 
 def _load_doc_into_form(doc: dict, source: str) -> None:
     """Shared by the JSON uploader and the version picker: replace form state."""
     personal, streams, goals, one_time = form_state_from_inputs(doc)
+    if not personal.get("phone"):
+        # Files from before phone was stored: keep whatever is typed now.
+        personal["phone"] = st.session_state.get("p_phone", "")
     for item in streams + goals + one_time:
         item["_uid"] = _next_uid()
     st.session_state.streams = streams
@@ -1019,6 +1031,7 @@ def init_state() -> None:
         "risk_profile": "Balanced",
         "retirement_mode": "earliest",
         "target_date": add_years(today, 25),
+        "phone": "",
     }
 
 
@@ -1721,6 +1734,7 @@ def main() -> None:
         st.divider()
         st.header("Client versions")
         phone_raw = st.text_input("Client phone number", key="p_phone",
+                                  value=d.get("phone", ""),
                                   placeholder="10-digit mobile",
                                   help="Keys the saved-version history. Every Run "
                                        "with a valid number saves a version.")
