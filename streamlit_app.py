@@ -28,6 +28,7 @@ from app.planning import (
     find_retirement_date,
     get_glide_paths,
     run_simulation,
+    validate_plan_config,
 )
 from app.planning.advisor_export import build_advisor_workbook
 from app.planning.engine import (
@@ -397,6 +398,9 @@ def build_inputs_json(config: dict, retirement_date=None) -> bytes:
     doc = {
         "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         "simulation_id": config.get("simulation_id", ""),
+        "retirement_mode": config.get("retirement_mode", "earliest"),
+        "target_age": config.get("target_age")
+        if config.get("retirement_mode") == "target_age" else None,
         "engine_version": ENGINE_SOURCE_SHA,
         "glidepath_version": GLIDEPATH_VERSION,
         "personal": {
@@ -464,6 +468,7 @@ def form_state_from_inputs(doc: dict):
 
     p = doc.get("personal") or {}
     risk = p.get("risk_profile")
+    mode = doc.get("retirement_mode")
     personal = {
         "client_name": str(p.get("client_name") or ""),
         "current_date": ts(p.get("current_date"), today),
@@ -471,6 +476,8 @@ def form_state_from_inputs(doc: dict):
         "target_lifetime": int(float(p.get("target_lifetime") or 90)),
         "current_corpus": int(float(p.get("current_corpus") or 0)),
         "risk_profile": risk if risk in RISK_PROFILES else "Balanced",
+        "retirement_mode": mode if mode in ("earliest", "target_age") else "earliest",
+        "target_age": int(float(doc.get("target_age") or 55)),
     }
 
     streams = []
@@ -536,6 +543,7 @@ def form_state_from_inputs(doc: dict):
 
 _PERSONAL_WIDGET_KEYS = (
     "p_client", "p_curdate_m", "p_curdate_y", "p_age", "p_life", "p_corpus", "p_risk",
+    "p_mode", "p_target_age",
 )
 
 
@@ -600,7 +608,8 @@ def _goal_outflow_rows(config: dict, resolve_date, death_date) -> tuple[list, fl
 
 def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
                       retirement_date=None, age_at_retirement=None, failure=None,
-                      comp_df=None, snapshot=None, death_date=None) -> bytes:
+                      comp_df=None, snapshot=None, death_date=None,
+                      mode_info=None) -> bytes:
     """Prepend a styled Summary sheet to the advisor workbook."""
     try:
         import io
@@ -657,10 +666,32 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
         # Verdict banner
         ws.merge_cells("A4:I4")
         ws.row_dimensions[4].height = 24
-        if kind == "success":
+        mi = mode_info or {}
+        if kind == "success" and mi.get("target_age") is not None:
+            extra = (f"  ·  earliest possible: {fmt_mon_yyyy(mi['earliest'])}"
+                     if mi.get("earliest") is not None else "")
+            put("A4", f"FEASIBLE at chosen age {mi['target_age']:.0f} "
+                      f"({fmt_mon_yyyy(retirement_date)}){extra}",
+                bold=True, size=13, color=GREEN_TX, fill=GREEN_BG)
+        elif kind == "success":
             put("A4", f"FEASIBLE — earliest retirement {fmt_mon_yyyy(retirement_date)}"
                       f" (age {age_at_retirement:.1f})",
                 bold=True, size=13, color=GREEN_TX, fill=GREEN_BG)
+        elif kind == "target_infeasible":
+            sip = mi.get("sip_needed")
+            if sip:
+                now = mi.get("monthly_now", 0)
+                msg = (f"NOT FUNDABLE at age {mi['target_age']:.0f} "
+                       f"({fmt_mon_yyyy(mi['chosen'])}) — additional SIP needed: "
+                       f"{format_inr(sip)}/month (raise {format_inr(now)} → "
+                       f"{format_inr(now + sip)})")
+            else:
+                msg = (f"NOT FUNDABLE at age {mi['target_age']:.0f} "
+                       f"({fmt_mon_yyyy(mi['chosen'])}) — not achievable by extra "
+                       f"SIP alone; revisit goal amounts or dates")
+            if mi.get("earliest") is not None:
+                msg += f"  ·  current plan supports {fmt_mon_yyyy(mi['earliest'])}"
+            put("A4", msg, bold=True, size=12, color=RED_TX, fill=RED_BG)
         else:
             f = failure or {}
             when = fmt_mon_yyyy(f["date"]) if f.get("date") else "—"
@@ -739,8 +770,12 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
         put(f"A{r}", "GOALS", bold=True, color=NAVY, fill=GREY_BG)
         ws.merge_cells(f"A{r}:I{r}")
         r += 1
-        resolve_date = pd.Timestamp(retirement_date) if kind == "success" \
-            else pd.Timestamp(death_date)
+        if kind == "success":
+            resolve_date = pd.Timestamp(retirement_date)
+        elif kind == "target_infeasible" and (mode_info or {}).get("chosen") is not None:
+            resolve_date = pd.Timestamp(mode_info["chosen"])
+        else:
+            resolve_date = pd.Timestamp(death_date)
         goal_rows, grand = _goal_outflow_rows(config, resolve_date, death_date)
         headers = ["Goal", "Type", "Nature", "Structure", "Starts", "Payments",
                    "Amount (today's ₹)", "Cost at start (FV)", "Total outflow (FV)"]
@@ -856,8 +891,16 @@ def fetch_versions(phone: str) -> list[dict]:
 
 def result_summary(out: dict) -> str:
     if out["kind"] == "success":
+        if out.get("target_age") is not None:
+            return (f"Age {out['target_age']:.0f} "
+                    f"({fmt_mon_yyyy(out['retirement_date'])}): feasible")
         return (f"Retire {fmt_mon_yyyy(out['retirement_date'])} "
                 f"(age {out['age_at_retirement']:.1f})")
+    if out["kind"] == "target_infeasible":
+        sip = out.get("sip_needed")
+        if sip:
+            return f"Age {out['target_age']:.0f}: needs +{format_inr(sip)}/mo"
+        return f"Age {out['target_age']:.0f}: not achievable via SIP"
     if out["kind"] == "infeasible":
         f = out.get("failure") or {}
         when = fmt_mon_yyyy(f["date"]) if f.get("date") else "?"
@@ -886,6 +929,23 @@ def save_version(phone: str, note: str, config: dict, out: dict) -> str | None:
     except Exception as e:
         st.session_state.versions_error = str(e)
         return None
+
+
+def _apply_sip_to_form(amount: int):
+    """st.button callback: turn the solver's answer into a real, visible stream."""
+    today = st.session_state.today
+    st.session_state.streams.append({
+        "_uid": _next_uid(), "name": "Additional SIP", "amount": int(amount),
+        "start_date": today, "end_date_mode": "At retirement",
+        "end_date": add_years(today, 30), "step_up_percent": 0.0,
+        "step_up_frequency": "Annual", "step_up_date": today,
+    })
+    st.session_state.run_output = None
+    st.session_state.upload_msg = (
+        "success",
+        f"Added an 'Additional SIP' stream of {format_inr(amount)}/month — "
+        "press Run simulation to verify the full plan.",
+    )
 
 
 def _apply_selected_version():
@@ -945,6 +1005,8 @@ def init_state() -> None:
         "target_lifetime": 90,
         "current_corpus": 10_000_000,
         "risk_profile": "Balanced",
+        "retirement_mode": "earliest",
+        "target_age": 55,
     }
 
 
@@ -1105,6 +1167,8 @@ def build_config(personal: dict) -> dict:
         "client_name": personal["client_name"] or "Playground",
         "m3_id": "playground",
         "phone": personal.get("phone") or "",
+        "retirement_mode": personal.get("retirement_mode") or "earliest",
+        "target_age": personal.get("target_age"),
         "investment_streams": streams,
         "goals": goals,
         "one_time_investments": one_time,
@@ -1126,8 +1190,13 @@ def build_output_json(config: dict, out: dict) -> bytes:
         "client_name": config.get("client_name", ""),
         "phone": config.get("phone", ""),
         "risk_profile": config.get("risk_profile", ""),
+        "retirement_mode": config.get("retirement_mode", "earliest"),
         "verdict": out["kind"],
     }
+    if out.get("target_age") is not None:
+        doc["target_age"] = float(out["target_age"])
+    if out.get("earliest_date") is not None:
+        doc["earliest_feasible_date"] = _iso_or_none(out["earliest_date"])
     if out["kind"] == "success":
         wealth = out.get("wealth")
         doc.update({
@@ -1142,6 +1211,17 @@ def build_output_json(config: dict, out: dict) -> bytes:
                 "amount": round(float(total.max()), 2),
                 "date": total.idxmax().strftime("%Y-%m-01"),
             }
+    elif out["kind"] == "target_infeasible":
+        f = out.get("failure") or {}
+        doc.update({
+            "target_date": _iso_or_none(out["chosen_date"]),
+            "sip_needed_monthly": out.get("sip_needed"),
+            "monthly_investment_now": round(out.get("monthly_now", 0), 2),
+            "failure": {
+                "date": _iso_or_none(f.get("date")),
+                "description": str(f.get("description", "Corpus depletion")),
+            },
+        })
     elif out["kind"] == "infeasible":
         f = out.get("failure") or {}
         doc["failure"] = {
@@ -1153,9 +1233,164 @@ def build_output_json(config: dict, out: dict) -> bytes:
     return json.dumps(doc, indent=2, ensure_ascii=False).encode("utf-8")
 
 
-def run_plan(config: dict) -> dict:
+# ── Target-age mode + SIP-needed search ─────────────────────────────────────
+# DECISIONS.md (2026-06-02) removed v3's target-date mode from the solver and
+# prescribed exactly this reintroduction: a thin wrapper that calls
+# run_simulation() once for the chosen date, keeping find_retirement_date()
+# solver-only. The engine stays untouched. Direct run_simulation callers must
+# validate the config themselves — the solver did that for us until now.
+
+SIP_SEARCH_START = 25_000       # first doubling probe (₹/month)
+SIP_SEARCH_CAP = 10_000_000     # ₹1 Cr/month — beyond this, report "not fixable by SIP"
+SIP_ROUND_TO = 500              # present a clean, verified number
+
+
+def target_retirement_date(config: dict) -> pd.Timestamp:
+    """Chosen age → month-grid date: current_date + (target_age − current_age) years."""
+    current = pd.Timestamp(config["current_date"])
+    years = int(round(float(config["target_age"]) - float(config["current_age"])))
+    return pd.Timestamp(current.year + years, current.month, 1)
+
+
+def _extra_sip_stream(config: dict, amount: float) -> dict:
+    """The solver's synthetic stream: flat (no step-up), today → retirement.
+
+    Never written to any export — when the CM accepts the number, the Apply
+    button adds a real, visible stream instead.
+    """
+    today = pd.Timestamp(config["current_date"])
+    return {
+        "name": "Additional SIP (solver)", "amount": float(amount),
+        "start_date": today, "end_date_mode": "At retirement", "end_date": None,
+        "step_up_percent": 0.0, "step_up_frequency": "Annual", "step_up_date": today,
+    }
+
+
+def sip_needed_search(config: dict, chosen_date: pd.Timestamp, instrument_params,
+                      glide_paths, progress=None) -> int | None:
+    """Minimum additional flat monthly SIP that makes chosen_date feasible.
+
+    Feasibility is monotone in money-in, so: double an upper bound until
+    feasible (capped), binary-search to ₹500, round UP, verify the final
+    number with one more full simulation. Returns None when even the cap
+    cannot rescue the plan.
+    """
+    def feasible(amount: float) -> bool:
+        if progress:
+            progress(f"Testing +{format_inr(amount)}/month …")
+        trial = dict(config)
+        trial["investment_streams"] = list(config.get("investment_streams") or []) \
+            + [_extra_sip_stream(config, amount)]
+        ok, *_rest = run_simulation(trial, chosen_date, instrument_params, glide_paths)
+        return bool(ok)
+
+    lo, hi = 0.0, float(SIP_SEARCH_START)
+    while not feasible(hi):
+        lo, hi = hi, hi * 2
+        if hi > SIP_SEARCH_CAP:
+            return None
+    while hi - lo > SIP_ROUND_TO:
+        mid = (lo + hi) / 2
+        if feasible(mid):
+            hi = mid
+        else:
+            lo = mid
+    import math
+    amount = int(math.ceil(hi / SIP_ROUND_TO) * SIP_ROUND_TO)
+    while not feasible(amount):            # guard the rounding edge, cheaply
+        amount += SIP_ROUND_TO
+    return amount
+
+
+def monthly_investment_today(config: dict) -> float:
+    current = pd.Timestamp(config["current_date"])
+    return sum(float(s.get("amount", 0) or 0)
+               for s in config.get("investment_streams") or []
+               if pd.Timestamp(s["start_date"]) <= current)
+
+
+def run_plan_target(config: dict, progress=None) -> dict:
+    """Chosen-age mode: feasibility at that date; if infeasible, the SIP gap."""
+    instrument_params = resolve_instrument_params(config["risk_profile"])
+    glide_paths = get_glide_paths()
+    current_date = pd.Timestamp(config["current_date"])
+    death_date = current_date + pd.DateOffset(
+        years=int(config["target_lifetime"] - config["current_age"])
+    )
+    try:
+        validate_plan_config(config)
+    except PlanValidationError as e:
+        return {"kind": "invalid", "errors": list(e.errors), "config": config}
+
+    chosen = target_retirement_date(config)
+    target_age = float(config["target_age"])
+
+    # Context both branches want: the earliest date the CURRENT plan supports.
+    solved = find_retirement_date(config, instrument_params, glide_paths)
+    earliest = pd.Timestamp(solved["retirement_date"]) if solved["success"] else None
+
+    success, _t, failure, pools_df, goal_dfs, comp_df = run_simulation(
+        config, chosen, instrument_params, glide_paths
+    )
+
+    if success:
+        snapshot = build_snapshot(comp_df, chosen) if not comp_df.empty else None
+        workbook = build_advisor_workbook(
+            config, {"success": True, "retirement_date": chosen, "failure": None},
+            comprehensive_df=comp_df, snapshot=snapshot,
+            goal_dfs=goal_dfs, pool_movements_df=pools_df,
+        )
+        workbook = add_summary_sheet(
+            workbook, config, kind="success", retirement_date=chosen,
+            age_at_retirement=target_age, comp_df=comp_df, snapshot=snapshot,
+            death_date=death_date, mode_info={"target_age": target_age,
+                                              "earliest": earliest},
+        )
+        return {
+            "kind": "success", "config": config,
+            "retirement_date": chosen, "age_at_retirement": target_age,
+            "target_age": target_age, "earliest_date": earliest,
+            "snapshot": snapshot, "wealth": wealth_frame(comp_df, death_date),
+            "goal_table": build_goal_results(config, chosen),
+            "workbook": workbook, "csv": csv_with_summary(comp_df),
+        }
+
+    sip = sip_needed_search(config, chosen, instrument_params, glide_paths, progress)
+    # retirement_date = the tested date: the diagnostic ran exactly there, and
+    # it lets the export resolve at-retirement goals (None would NaT-crash it).
+    diag_result = {"success": False, "retirement_date": chosen, "failure": failure}
+    try:
+        workbook = build_advisor_workbook(
+            config, diag_result, comprehensive_df=comp_df, snapshot=None,
+            goal_dfs=goal_dfs, pool_movements_df=pools_df,
+        )
+        workbook = add_summary_sheet(
+            workbook, config, kind="target_infeasible", failure=failure,
+            comp_df=comp_df, death_date=death_date,
+            mode_info={"target_age": target_age, "chosen": chosen,
+                       "earliest": earliest, "sip_needed": sip,
+                       "monthly_now": monthly_investment_today(config)},
+        )
+    except Exception:
+        workbook = None
+    return {
+        "kind": "target_infeasible", "config": config,
+        "target_age": target_age, "chosen_date": chosen,
+        "earliest_date": earliest, "sip_needed": sip,
+        "monthly_now": monthly_investment_today(config),
+        "failure": failure,
+        "goal_table": build_goal_results(config, None),
+        "workbook": workbook,
+        "csv": csv_with_summary(comp_df)
+        if comp_df is not None and not comp_df.empty else None,
+    }
+
+
+def run_plan(config: dict, progress=None) -> dict:
     """Solve + simulate; returns everything the results pane needs."""
     config["simulation_id"] = new_simulation_id()
+    if config.get("retirement_mode") == "target_age":
+        return run_plan_target(config, progress=progress)
     instrument_params = resolve_instrument_params(config["risk_profile"])
     glide_paths = get_glide_paths()
     current_date = pd.Timestamp(config["current_date"])
@@ -1177,7 +1412,11 @@ def run_plan(config: dict) -> dict:
         _s, _t, failure, pools_df, goal_dfs, comp_df = run_simulation(
             config, death_date, instrument_params, glide_paths
         )
-        diag_result = {"success": False, "retirement_date": None, "failure": failure}
+        # The diagnostic ran AT death_date — pass it so the export can resolve
+        # at-retirement goals (retirement_date=None NaT-crashed _goals_sheet,
+        # which used to degrade these workbooks to None).
+        diag_result = {"success": False, "retirement_date": death_date,
+                       "failure": failure}
         try:
             workbook = build_advisor_workbook(
                 config, diag_result, comprehensive_df=comp_df, snapshot=None,
@@ -1277,10 +1516,80 @@ def render_results(out: dict) -> None:
         )
         return
 
+    if out["kind"] == "target_infeasible":
+        age = out["target_age"]
+        chosen = out["chosen_date"]
+        sip = out.get("sip_needed")
+        st.error(f"Retiring at age **{age:.0f}** ({fmt_mon_yyyy(chosen)}) is "
+                 "**not fundable** with the current plan.")
+        if sip:
+            now = out.get("monthly_now", 0)
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Additional SIP needed", f"{short_inr(sip)}/mo")
+            m2.metric("Monthly investment", f"{short_inr(now)} → {short_inr(now + sip)}")
+            m3.metric("Current plan supports",
+                      fmt_mon_yyyy(out["earliest_date"])
+                      if out.get("earliest_date") is not None else "no age")
+            st.caption(
+                f"A flat additional SIP of **{format_inr(sip)}/month** (no step-up, "
+                f"starting now, until retirement) makes age {age:.0f} feasible — "
+                "verified by a full simulation at exactly that amount."
+            )
+            st.button(
+                f"➕ Apply +{format_inr(sip)}/month to the form",
+                on_click=_apply_sip_to_form, args=(sip,),
+            )
+        else:
+            st.warning(
+                "No realistic additional SIP fixes this date — the shortfall is "
+                "structural (goals due too soon or too large). Revisit goal "
+                "amounts/dates, or pick a later retirement age."
+                + (f" The current plan supports "
+                   f"**{fmt_mon_yyyy(out['earliest_date'])}**."
+                   if out.get("earliest_date") is not None else "")
+            )
+        failure = out.get("failure") or {}
+        if failure:
+            st.caption(f"Without the extra SIP, first failure: "
+                       f"{fmt_mon_yyyy(failure.get('date'))} — "
+                       f"{failure.get('description', 'Corpus depletion')}")
+        if not out["goal_table"].empty:
+            st.dataframe(out["goal_table"], use_container_width=True, hide_index=True)
+        st.subheader("Downloads")
+        d1, d2, d3 = st.columns(3)
+        if out.get("workbook"):
+            d1.download_button(
+                "📗 Advisor workbook (Excel)", data=out["workbook"],
+                file_name="financial_plan_advisor.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_wb_target",
+            )
+        if out.get("csv"):
+            d2.download_button(
+                "📄 Comprehensive monthly (CSV)", data=out["csv"],
+                file_name="financial_plan_monthly.csv", mime="text/csv",
+                key="dl_csv_target",
+            )
+        d3.download_button(
+            "📥 Inputs (JSON)", data=build_inputs_json(out["config"]),
+            file_name=inputs_filename(out["config"]), mime="application/json",
+            key="dl_inputs_target",
+        )
+        st.caption("Diagnostic outputs at the chosen retirement date, without the "
+                   "extra SIP. Use 'Apply to the form' and re-run for the full "
+                   "feasible-plan artifacts.")
+        return
+
     ret = out["retirement_date"]
     snap = out["snapshot"] or {}
-    st.success(f"Earliest feasible retirement: **{fmt_mon_yyyy(ret)}** "
-               f"(age {out['age_at_retirement']:.1f})")
+    if out.get("target_age") is not None:
+        extra = (f" · earliest possible: **{fmt_mon_yyyy(out['earliest_date'])}**"
+                 if out.get("earliest_date") is not None else "")
+        st.success(f"Retiring at age **{out['target_age']:.0f}** "
+                   f"({fmt_mon_yyyy(ret)}) is **feasible**{extra}")
+    else:
+        st.success(f"Earliest feasible retirement: **{fmt_mon_yyyy(ret)}** "
+                   f"(age {out['age_at_retirement']:.1f})")
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Retirement", fmt_mon_yyyy(ret))
@@ -1361,6 +1670,30 @@ def main() -> None:
             "fixed pool returns: debt 6%, hybrid 10%."
         )
         st.divider()
+        st.header("Retirement")
+        _mode_labels = {"earliest": "Earliest possible", "target_age": "At a chosen age"}
+        mode_label = st.radio(
+            "Retirement date", list(_mode_labels.values()),
+            index=0 if d.get("retirement_mode", "earliest") == "earliest" else 1,
+            key="p_mode", horizontal=True,
+            help="Earliest possible = the solver finds the first feasible month. "
+                 "At a chosen age = test that age; if it is not fundable, the app "
+                 "computes the additional SIP needed.",
+        )
+        retirement_mode = "earliest" if mode_label == _mode_labels["earliest"] else "target_age"
+        target_age = None
+        if retirement_mode == "target_age":
+            target_age = st.number_input(
+                "Retire at age", min_value=int(current_age),
+                max_value=max(int(current_age), int(target_lifetime) - 1),
+                value=min(max(int(d.get("target_age", 55)), int(current_age)),
+                          max(int(current_age), int(target_lifetime) - 1)),
+                step=1, key="p_target_age",
+            )
+            _td = pd.Timestamp(current_date.year + (int(target_age) - int(current_age)),
+                               current_date.month, 1)
+            st.caption(f"Age {int(target_age)} = **{fmt_mon_yyyy(_td)}**")
+        st.divider()
         st.header("Client versions")
         phone_raw = st.text_input("Client phone number", key="p_phone",
                                   placeholder="10-digit mobile",
@@ -1415,6 +1748,8 @@ def main() -> None:
         "current_corpus": current_corpus,
         "risk_profile": risk_profile,
         "phone": phone,
+        "retirement_mode": retirement_mode,
+        "target_age": target_age,
     }
 
     left, right = st.columns([1, 1], gap="large")
@@ -1469,8 +1804,15 @@ def main() -> None:
     st.divider()
     if st.button("▶ Run simulation", type="primary", use_container_width=True):
         config = build_config(personal)
-        with st.spinner("Solving for the earliest feasible retirement date…"):
-            st.session_state.run_output = run_plan(config)
+        spin_text = ("Testing the chosen retirement age…"
+                     if retirement_mode == "target_age"
+                     else "Solving for the earliest feasible retirement date…")
+        progress_slot = st.empty()
+        with st.spinner(spin_text):
+            st.session_state.run_output = run_plan(
+                config, progress=lambda msg: progress_slot.caption(msg)
+            )
+        progress_slot.empty()
         # Auto-save this run as a version when a valid phone number is set.
         if phone and versions_available():
             version = save_version(phone, note, config, st.session_state.run_output)
