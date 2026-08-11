@@ -6,6 +6,69 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-11 — Replenishing pools now PRE-FUND before the first payout (`+poolprefund`)
+
+**What changed:** `run_simulation` starts the Debt/Hybrid pool simulation up to
+`POOL_PREFUND_MONTHS` (48) before the first *net* payout instead of on the payout
+date itself:
+
+```
+old: pool_start = min(first_net_payout, retirement_date)
+new: pool_start = max(current_date,
+                      min(first_net_payout - 48 months, retirement_date))
+```
+
+Nothing else moved — no new provisioning maths. The existing annual-cycle
+lookahead windows (Debt = next 24 months, Hybrid = months 25–48) turn the earlier
+start into a graduated ramp on their own. Engine stamp bumped to
+`1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund`.
+
+**Why:** the old rule produced a **provisioning cliff**. For the common case
+(payouts starting at/before retirement — i.e. every retirement-income goal) the
+pool did nothing at all beforehand and then demanded the pools' entire 48-month
+horizon from the Core Corpus in the single month the payouts began. Measured on a
+₹1L/month payout stream: ₹20.6L into Debt + ₹16.8L into Hybrid in one month, with
+zero movements before it.
+
+Two things made this a defect rather than a policy:
+
+1. **It contradicted the model's own philosophy.** Non-replenishing goals de-risk
+   gradually via glide paths (Non-Negotiable starts 5 years out in four annual
+   slices). Replenishing goals — the same underlying need, money that must be safe
+   when spent — did it all in one day. In advice terms the old behaviour meant
+   "stay fully in equity until the day income starts, then liquidate four years of
+   spending at once", concentrating sequence-of-returns risk on a single date,
+   which is exactly what the Debt/Hybrid buckets exist to prevent.
+2. **The engine already pre-funded — inconsistently.** When a goal starts *after*
+   retirement, `min()` returned the retirement date and the pool ramped smoothly
+   (measured: first inflow 3 years ahead, then annual top-ups). The cliff was an
+   artifact of that `min()`, not a deliberate rule.
+
+Confirmed as unintended with Punit (model owner), who also confirmed the
+playground is now the **only** financial-plan build — the CRM no longer runs one —
+so there is no divergence to manage.
+
+**Trade-off / numerical impact:** money leaves the Core Corpus earlier, so it
+compounds less: strictly-feasible plans can see slightly later retirement dates
+and lower terminal wealth. Against that, the single-month cliff disappears, so
+plans that failed only because the corpus was momentarily short at the first
+payout can now pass. The direction is plan-specific, not uniformly favourable, and
+every plan containing a Replenishing goal moves at least slightly. A
+baseline-vs-patched replay over the full logged-run corpus accompanies this
+change.
+
+**Not fixed by this:** a goal whose payouts begin so soon after the plan start
+that there is no runway to ramp into (e.g. first payout 8 months in) still
+provisions in one lump — `pool_start` is floored at `current_date`. That is
+genuine underfunding, not a modelling artifact.
+
+**When to revisit:** if the ramp should be *proportional* (e.g. an explicit
+25%-per-year schedule like the glide-path sheets) rather than "whatever the 24/48
+month lookahead windows imply", that is a larger change to `simulate_pool`'s
+targeting logic and should be specced separately.
+
+---
+
 ## 2026-06-03 — Renamed "income streams" → "investment streams" and "windfalls" → "one-time investments" (everywhere, incl. config keys)
 
 **What changed:** a terminology rename across the whole stack — UI labels, config keys, function names, dataframe columns, advisor export sheets, and docs. No behavioural change.

@@ -148,7 +148,8 @@ def _parity_config_2():
 class TestParityGoldenMaster:
     def test_glidepath_version_pinned(self):
         assert GLIDEPATH_VERSION == 1
-        assert engine.ENGINE_SOURCE_SHA == "1515f1e+pool2x2+lifetimefix+monthgrid"
+        assert engine.ENGINE_SOURCE_SHA == (
+            "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund")
 
     def test_parity_config_1_retirement_date(self):
         res = find_retirement_date(_parity_config_1())
@@ -156,35 +157,52 @@ class TestParityGoldenMaster:
         assert res["retirement_date"] == pd.Timestamp("2032-09-01")
 
     def test_parity_config_1_snapshot_totals(self):
-        """Golden-master RE-BASELINED for +monthgrid (Plan 223, 2026-06-17).
+        """Golden-master RE-BASELINED for +poolprefund (2026-08-11).
 
-        The step-up anchor shifted from ``TODAY - 1 day`` (2026-04-30) to
-        ``TODAY`` (2026-05-01 = day 1). For an Annual step-up, the first event
-        was previously at 2027-04-30; it is now at 2027-05-01. This shifts some
-        step-up events by one month, producing slightly different corpus flows.
-        The retirement date is UNCHANGED (2032-09-01).
+        Previously re-baselined for +monthgrid (Plan 223, 2026-06-17).
 
-        Delta attribution:
-          Amount.sum: -425,234,715 -> -425,161,503  (+73,212, +0.017% — step-up timing)
-          units.sum:  405.50 -> 921.48  (higher corpus at same retirement date = more units)
-          tax.sum:    53,164,640 -> 53,168,584  (+3,944, +0.007%)
-          Core Corpus Value (last): 36,556,201 -> 83,071,801
-              (higher final corpus because more step-up events fire in some months)
-        All deltas attributable to step-up anchor move from day-1 to day=1 month-start.
-        No unexplained drift — reconciliation PASS (D-P223-7).
+        The Debt/Hybrid pools now start provisioning up to 48 months before the
+        first net payout instead of on the payout date itself (DECISIONS.md
+        2026-08-11). This config's Replenishing "Retirement Income" starts at
+        retirement (Sep 2032); pre-funding now begins Sep 2029 — 36 months
+        earlier, the point at which those payouts first enter the pools'
+        48-month lookahead.
+
+        Retirement date UNCHANGED (2032-09-01) — the solver is unaffected.
+
+        Delta attribution (+monthgrid baseline -> +poolprefund):
+          len(ft):    136 -> 138  (+2 = the extra annual pool-refill events
+                      during the 3-year ramp; NOT a systemic change — a
+                      systemic one would add dozens)
+          Amount.sum: -425,161,503 -> -424,574,896  (+586,607, +0.138%)
+          units.sum:  921.48 -> 260.72  (-71.7%)
+          tax.sum:    53,168,584 -> 53,078,485  (-90,099, -0.170%)
+          Core Corpus Value (last): 83,071,801 -> 23,503,740  (-71.7%)
+
+        units.sum and Core Corpus Value (last) move by the SAME -71.7067%
+        because they are the same quantity (residual units x final NAV) — an
+        internal consistency check that passes. The residual falls because ~4
+        years of payouts leave equity (12%) for debt/hybrid (6%/10%) three years
+        earlier; that one-time drag then compounds across the remaining ~54
+        years of the plan, and the terminal residual is a small difference of
+        large numbers, so it moves far more than proportionally. Steady-state
+        pool sizing after the first payout is unchanged.
+
+        This is the intended cost of removing the provisioning cliff.
+        No unexplained drift — reconciliation PASS.
         """
         cfg = _parity_config_1()
         res = find_retirement_date(cfg)
         rd = res["retirement_date"]
         success, ft, fail, pm, gd, comp = run_simulation(cfg, rd, _DEFAULT_INSTRUMENT_PARAMS)
         assert success is True
-        assert len(ft) == 136
-        assert ft["Amount"].sum() == pytest.approx(-425161503.244827, rel=1e-9)
-        assert ft["units"].sum() == pytest.approx(921.4769024035, rel=1e-9)
-        assert ft["tax"].sum() == pytest.approx(53168584.529756, rel=1e-9)
+        assert len(ft) == 138
+        assert ft["Amount"].sum() == pytest.approx(-424574896.688345, rel=1e-9)
+        assert ft["units"].sum() == pytest.approx(260.7160668148, rel=1e-9)
+        assert ft["tax"].sum() == pytest.approx(53078485.185414, rel=1e-9)
         assert sorted(gd.keys()) == ["Retirement Home"]
         assert len(comp) == 720
-        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(83071801.463573, rel=1e-9)
+        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(23503739.794575, rel=1e-9)
 
     def test_parity_config_2_retirement_date(self):
         res = find_retirement_date(_parity_config_2())
@@ -192,30 +210,45 @@ class TestParityGoldenMaster:
         assert res["retirement_date"] == pd.Timestamp("2028-02-01")
 
     def test_parity_config_2_snapshot_totals(self):
-        """Golden-master RE-BASELINED for +monthgrid (Plan 223, 2026-06-17).
+        """Golden-master RE-BASELINED for +poolprefund (2026-08-11).
 
-        Same step-up anchor shift (2026-04-30 -> 2026-05-01). Retirement date
-        UNCHANGED (2028-02-01).
+        Previously re-baselined for +monthgrid (Plan 223, 2026-06-17).
 
-        Delta attribution:
-          Amount.sum: -89,402,122 -> -89,382,345  (+19,777, +0.022%)
-          units.sum:  2823.68 -> 3003.81  (higher corpus = more units invested)
-          tax.sum:    11,221,510 -> 11,221,733  (+223, ~0.002%)
-          Core Corpus Value (last): 11,911,163 -> 12,671,024
-        All deltas attributable to step-up anchor move. Reconciliation PASS (D-P223-7).
+        Same change as config 1, but this config exercises the OTHER branch:
+        its first payout is Jan 2027, only 8 months after the plan start
+        (May 2026), so the 48-month ramp is clamped by the ``current_date``
+        floor and pre-funding begins at the plan start — 8 months of ramp, not
+        36. This is the deliberate "no runway" case: a payout too soon to glide
+        into still provisions in one bite, because there is no earlier month to
+        provision in.
+
+        Retirement date UNCHANGED (2028-02-01).
+
+        Delta attribution (+monthgrid baseline -> +poolprefund):
+          len(ft):    62 -> 64  (+2 ramp refill events)
+          Amount.sum: -89,382,345 -> -88,697,219  (+685,126, +0.767%)
+          units.sum:  3003.81 -> 1941.43  (-35.4%)
+          tax.sum:    11,221,733 -> 11,130,370  (-91,363, -0.814%)
+          Core Corpus Value (last): 12,671,024 -> 8,189,542  (-35.4%)
+
+        units.sum and Core Corpus Value (last) again move by an identical
+        -35.3680% (same quantity, two views) — consistency check PASS. The
+        residual drop is roughly half config 1's because the ramp here is 8
+        months, not 36, so less time is spent out of equity.
+        No unexplained drift — reconciliation PASS.
         """
         cfg = _parity_config_2()
         res = find_retirement_date(cfg)
         rd = res["retirement_date"]
         success, ft, fail, pm, gd, comp = run_simulation(cfg, rd, _DEFAULT_INSTRUMENT_PARAMS)
         assert success is True
-        assert len(ft) == 62
-        assert ft["Amount"].sum() == pytest.approx(-89382345.708167, rel=1e-9)
-        assert ft["units"].sum() == pytest.approx(3003.8141561920, rel=1e-9)
-        assert ft["tax"].sum() == pytest.approx(11221733.073649, rel=1e-9)
+        assert len(ft) == 64
+        assert ft["Amount"].sum() == pytest.approx(-88697219.273701, rel=1e-9)
+        assert ft["units"].sum() == pytest.approx(1941.4264998082, rel=1e-9)
+        assert ft["tax"].sum() == pytest.approx(11130369.954144, rel=1e-9)
         assert sorted(gd.keys()) == ["Marriage Elder", "Marriage Younger"]
         assert len(comp) == 396
-        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(12671024.045794, rel=1e-9)
+        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(8189541.890101, rel=1e-9)
 
     def test_glide_paths_byte_match_columns(self):
         gp = get_glide_paths()

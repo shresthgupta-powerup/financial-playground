@@ -31,7 +31,15 @@ from .validation import validate_plan_config
 # coercion (all input dates snapped to day=1, step-up anchor -> current_date).
 # Bump this whenever the engine's numeric behaviour changes, so two saved plans
 # with the same stamp always reproduce.
-ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid"
+ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund"
+
+# Pool pre-funding horizon (2026-08-11, "+poolprefund"). The Debt/Hybrid pools
+# now begin provisioning up to this many months BEFORE the first net payout
+# instead of on the payout date itself. 48 = the pools' own horizon (Debt covers
+# months 0-24, Hybrid 25-48), so the existing lookahead windows convert the
+# earlier start into a graduated ramp with no other change. See the
+# 2026-08-11 entry in v3_docs/DECISIONS.md.
+POOL_PREFUND_MONTHS = 48
 
 # ---------------------------------------------------------------------------
 # All Date columns / Timestamps must use a single resolution to avoid
@@ -962,7 +970,24 @@ def run_simulation(config, retirement_date, instrument_params, glide_paths=None)
         core_replenishments_df = pd.DataFrame()
         pool_movements_df = pd.DataFrame()
     else:
-        pool_start = min(pd.Timestamp(net_payouts_df['Date'].min()), retirement_date)
+        # Pre-funding ramp ("+poolprefund", 2026-08-11). Previously:
+        #     pool_start = min(first_net_payout, retirement_date)
+        # which meant a plan whose payouts begin AT or BEFORE retirement (the
+        # common retirement-income case) provisioned the pools' whole 48-month
+        # horizon in the single month the payouts START — a cliff — while a plan
+        # whose payouts begin AFTER retirement pre-funded smoothly through the
+        # very same machinery. Starting up to POOL_PREFUND_MONTHS earlier lets
+        # the existing lookahead windows (Debt 0-24m, Hybrid 25-48m) build the
+        # pools gradually over the preceding annual cycles, mirroring how
+        # glide paths de-risk Non-replenishing goals. Never earlier than the
+        # plan start; the result is always <= the previous pool_start, so
+        # provisioning can only begin earlier, never later.
+        first_net_payout = pd.Timestamp(net_payouts_df['Date'].min())
+        pool_start = max(
+            current_date,
+            min(first_net_payout - pd.DateOffset(months=POOL_PREFUND_MONTHS),
+                retirement_date),
+        )
         (pool_trans_df, core_replenishments_df,
          failure_date, failure_reason, pool_movements_df) = simulate_pool(
             net_payouts_df, debt_nav_df, hybrid_nav_df,
