@@ -6,6 +6,51 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-20 — Duplicate goal names no longer silently drop a goal (`+goaldedupe`)
+
+**What changed:** `run_simulation` disambiguates non-replenishing goal names
+before they become `goal_dfs` keys. The FIRST goal of a given name keeps that
+name exactly; a second goal with the same name becomes `<name> #2`, a third
+`<name> #3`. Engine stamp bumped to
+`1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe`.
+
+**The bug:** `goal_dfs` is a plain dict keyed by the goal's (user-supplied) name
+— `engine.py`, "1. Non-replenishing goals -> chain math". Two goals with the
+same name, and for Recurring goals the same occurrence count, produced identical
+keys, so the later goal **silently overwrote** the earlier one. The overwritten
+goal was then never provisioned, never withdrawn for, and absent from every
+output (comprehensive view columns, per-goal Excel sheets, action plan) — while
+the plan still reported SUCCESS at an impossibly early retirement date. Nothing
+warned.
+
+This is not exotic: two children's education goals are routinely both called
+"Child Education", and the app's own goal templates always insert the same
+default name, so the collision is the *expected* outcome of normal CM behaviour.
+
+**Discovered** from a real run (Gajender Patel v4, 2026-08-20): two "Child
+Education" goals, one starting 2032 and one 2040. The CM asked why the 2032
+goal's money never appeared. Reproduced: the 2032 goal was absent — 4 tranche
+chains instead of 8, Rs 89.5L of chain funding instead of Rs 1.20 Cr, and the
+plan reported **Oct 2040** when the true answer with both goals funded is
+**Aug 2045** — five years optimistic.
+
+**Blast radius (logged corpus, 322 rows):** 34 runs across 5 clients had at
+least one silently dropped goal — Anmol Agrawal, Laxmidhar Souche, Gajender
+Patel, Ruchi Takkar (+ one Playground row). Those plans must be re-run; their
+results were materially wrong, always in the optimistic direction.
+
+**Trade-off:** plans with duplicate goal names now provision every goal, so
+their retirement dates move LATER (they were previously funding fewer goals
+than the CM entered). Plans with unique goal names are byte-identical to before
+— the first goal of a name is untouched, so no existing correct output changes.
+Outputs for duplicated names now show `<name> #2`, which is visible in the
+Excel per-goal sheets and CSV columns.
+
+**When to revisit:** if goals ever gain a stable id, key `goal_dfs` by that id
+and use the name for display only; the name would then never need suffixing.
+
+---
+
 ## 2026-08-11 — Replenishing pools now PRE-FUND before the first payout (`+poolprefund`)
 
 **What changed:** `run_simulation` starts the Debt/Hybrid pool simulation up to

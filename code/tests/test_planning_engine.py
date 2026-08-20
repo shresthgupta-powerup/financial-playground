@@ -149,7 +149,7 @@ class TestParityGoldenMaster:
     def test_glidepath_version_pinned(self):
         assert GLIDEPATH_VERSION == 1
         assert engine.ENGINE_SOURCE_SHA == (
-            "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund")
+            "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe")
 
     def test_parity_config_1_retirement_date(self):
         res = find_retirement_date(_parity_config_1())

@@ -31,7 +31,7 @@ from .validation import validate_plan_config
 # coercion (all input dates snapped to day=1, step-up anchor -> current_date).
 # Bump this whenever the engine's numeric behaviour changes, so two saved plans
 # with the same stamp always reproduce.
-ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund"
+ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe"
 
 # Pool pre-funding horizon (2026-08-11, "+poolprefund"). The Debt/Hybrid pools
 # now begin provisioning up to this many months BEFORE the first net payout
@@ -931,14 +931,29 @@ def run_simulation(config, retirement_date, instrument_params, glide_paths=None)
     # 1. Non-replenishing goals -> chain math, one tranche per occurrence.
     goal_dfs = {}
     last_goal_date = current_date
+    # Goal names are user-supplied and need NOT be unique -- two children's
+    # "Child Education" goals are the norm, and the app's goal templates all
+    # insert the same default name. goal_dfs is keyed by that name, so before
+    # "+goaldedupe" (2026-08-20) a second goal with the same name -- and, for
+    # Recurring goals, the same occurrence count -- produced identical keys and
+    # SILENTLY OVERWROTE the first. The first goal was then never provisioned,
+    # never withdrawn for, and absent from every output, while the plan still
+    # reported success at an impossibly early retirement date. Disambiguate per
+    # goal below; the FIRST goal of a given name keeps that name exactly, so
+    # output for plans without duplicates is byte-identical to before.
+    _goal_name_counts = {}
     for goal in goals:
         if str(goal.get('nature', '')).lower() == 'replenishing':
             continue
+        _base_name = goal['name']
+        _seen = _goal_name_counts.get(_base_name, 0)
+        _goal_name_counts[_base_name] = _seen + 1
+        _disp_name = _base_name if _seen == 0 else f"{_base_name} #{_seen + 1}"
         tranches = expand_recurring_goal_to_tranches(goal, current_date)
         for i, (tranche_date, tranche_fv) in enumerate(tranches):
             if tranche_date > last_goal_date:
                 last_goal_date = tranche_date
-            label = goal['name'] if len(tranches) == 1 else f"{goal['name']} ({i+1}/{len(tranches)})"
+            label = _disp_name if len(tranches) == 1 else f"{_disp_name} ({i+1}/{len(tranches)})"
             goal_dfs[label] = calculate_goal_cashflows(
                 input_df=glide_paths[goal['type']],
                 end_date=tranche_date,
