@@ -175,6 +175,36 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
     return base
 
 
+def unique_goal_name(name: str, existing) -> str:
+    """First use keeps the name; later duplicates get ' 2', ' 3', ...
+
+    Goal names identify a goal's funding chain in the engine, so two goals
+    sharing a name used to collide (fixed engine-side by +goaldedupe, which
+    labels the second '<name> #2'). We make the names distinct HERE, in the
+    form, so the CM sees and controls them instead of discovering a rename in
+    the Excel later.
+    """
+    name = (name or "Goal").strip() or "Goal"
+    existing = set(existing)
+    if name not in existing:
+        return name
+    n = 2
+    while f"{name} {n}" in existing:
+        n += 1
+    return f"{name} {n}"
+
+
+def duplicate_goal_names(goals) -> list:
+    """Names used by more than one goal (order preserved)."""
+    seen, dupes = set(), []
+    for g in goals:
+        nm = (g.get("name") or "").strip()
+        if nm and nm in seen and nm not in dupes:
+            dupes.append(nm)
+        seen.add(nm)
+    return dupes
+
+
 def normalise_goal(goal: dict) -> dict:
     """Progressive-disclosure reset (mirror planForm.normaliseGoal).
 
@@ -550,6 +580,13 @@ def form_state_from_inputs(doc: dict):
             "end_date": ts(g.get("end_date")),
             "inflation_percent": num(g.get("inflation_percent"), 6.0),
         }))
+
+    # Saved plans from before the duplicate-name fix can carry two goals with
+    # the same name; number them on load so the CM sees them as separate.
+    _names = []
+    for g in goals:
+        g["name"] = unique_goal_name(g.get("name"), _names)
+        _names.append(g["name"])
 
     one_time = []
     for w in doc.get("one_time_investments") or []:
@@ -1868,9 +1905,22 @@ def main() -> None:
             new = make_goal_from_template(
                 GOAL_TEMPLATES[template_label], len(st.session_state.goals), today
             )
+            # Templates always insert the same default name (two children both
+            # get "Child Education"), so number the duplicate immediately.
+            new["name"] = unique_goal_name(
+                new["name"], [g.get("name") for g in st.session_state.goals])
             new["_uid"] = _next_uid()
             st.session_state.goals.append(new)
             st.rerun()
+        _dupes = duplicate_goal_names(st.session_state.goals)
+        if _dupes:
+            st.warning(
+                "Two or more goals share a name: **"
+                + "**, **".join(_dupes)
+                + "**. They are simulated as separate goals and each is fully "
+                  "funded — outputs label the repeats “Name #2”, “Name #3”. "
+                  "Rename them here if you want your own labels."
+            )
 
     st.divider()
     if st.button("▶ Run simulation", type="primary", use_container_width=True):
