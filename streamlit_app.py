@@ -1751,9 +1751,12 @@ def main() -> None:
     today = st.session_state.today
 
     st.title("🧮 Financial Planning Playground")
+    # NB: this engine is no longer the untouched handoff copy — it is the sole
+    # Financial Plan build and has deliberate changes on top (DECISIONS.md).
     st.caption(
-        f"Engine `{ENGINE_SOURCE_SHA}` · glide paths v{GLIDEPATH_VERSION} — "
-        "byte-identical copy of the production Financial Plan engine (CRM handoff, 2026-07-17)."
+        f"Engine `{ENGINE_SOURCE_SHA}` · glide paths v{GLIDEPATH_VERSION} — the "
+        "sole Financial Plan build, forked from the CRM handoff (2026-07-17); "
+        "every engine change since is logged in `v3_docs/DECISIONS.md`."
     )
 
     # Sidebar: personal & corpus + risk profile. Defaults come from
