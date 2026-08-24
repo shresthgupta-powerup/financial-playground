@@ -42,18 +42,18 @@ from app.planning.engine import (
     expand_recurring_goal_to_tranches,
     format_inr,
 )
+from app.planning.goal_grid import goal_sleeves
 from app.planning.schemas import RISK_PROFILE_CORE_RETURNS
 
 # ── Picklists (mirror planForm.js) ──────────────────────────────────────────
 GOAL_TYPES = ["Non-Negotiable", "Semi-Negotiable", "Negotiable"]
 GOAL_NATURES = ["Non-replenishing", "Replenishing"]
 
-# 2026-08-14: the two-layer selection is back (nature first; Non-replenishing
-# goals additionally choose a Lumpsum/Recurring structure), reverting the
-# 2026-07-30 payout-count rule AND the display rename that depended on it —
-# with a structure picker present, nature must be shown under its own names.
-# Loading files saved during the rename era still works: NATURE_FROM_DISPLAY
-# maps their display words back (see form_state_from_inputs).
+# v2 (2026-08-24): "nature" is no longer asked. A goal's purpose is DERIVED —
+# does it still have cashflows beyond the grid's reach when this plan ends?
+# The form asks Structure (one-time vs recurring) and Type (negotiability);
+# GOAL_NATURES / NATURE_FROM_DISPLAY survive only so saved files from every
+# earlier era still load (their stored nature is read and ignored).
 NATURE_FROM_DISPLAY = {"Lumpsum": "Non-replenishing", "Recurring": "Replenishing"}
 GOAL_STRUCTURES = ["Lumpsum", "Recurring"]
 GOAL_START_MODES = ["Fixed", "At retirement"]
@@ -210,15 +210,38 @@ def duplicate_goal_names(goals) -> list:
     return dupes
 
 
+def goal_purpose(goal: dict, current_date) -> str:
+    """Derived purpose (§4.5): does this goal outlive the plan's carve window?
+
+    Never an input — it falls out of the cashflow series and the grid's reach
+    for the goal's negotiability (5 / 4 / 3 years). Read it as a statement
+    about TODAY: a one-time goal further out than its column's reach is
+    "beyond the window" right now and enters it in a later month, exactly as a
+    40-year income stream's later occurrences do. That is why the wording is
+    about the window and not about the goal being endless.
+    """
+    try:
+        g = dict(goal)
+        g["negotiability"] = g.get("type")
+        g["structure"] = "recurring" if g.get("structure") == "Recurring" else "one-time"
+        g["occurrences"] = g.get("occurrences") or 1
+        g["frequency"] = (g.get("frequency") or "monthly").lower()
+        g["inflation"] = float(g.get("inflation_percent", 0) or 0) / 100.0
+        sleeves = goal_sleeves(g, current_date, apply_tax=False)
+    except Exception:
+        return ""
+    return ("Extends beyond the funding window"
+            if sleeves["purpose"] == "GOAL_REPLENISH"
+            else "Fully inside the funding window")
+
+
 def normalise_goal(goal: dict) -> dict:
     """Progressive-disclosure reset (mirror planForm.normaliseGoal).
 
-    Replenishing goals are always a recurring payout stream; Non-replenishing
-    goals carry their own Lumpsum/Recurring structure choice.
+    v2: Structure is the goal's own input — a stored ``nature`` from an older
+    saved file no longer overrides it.
     """
     g = dict(goal)
-    if g["nature"] == "Replenishing":
-        g["structure"] = "Recurring"
     if g.get("structure") not in GOAL_STRUCTURES:
         g["structure"] = "Lumpsum"
     if g["structure"] == "Lumpsum":
@@ -287,7 +310,7 @@ def build_goal_results(config: dict, retirement_date) -> pd.DataFrame:
         inflation = float(goal.get("inflation_percent", 0) or 0)
         rows.append({
             "Goal": goal.get("name", ""),
-            "Nature": goal.get("nature", ""),
+            "Purpose (derived)": goal_purpose(goal, current_date),
             "Structure": goal.get("structure", ""),
             "Starts": fmt_mon_yyyy(start),
             "Amount (today's ₹)": format_inr(pv),
@@ -360,7 +383,7 @@ _FREQ_TO_CRM = {"Half-Yearly": "Half-yearly"}
 _FREQ_MONTHS = {"Monthly": 1, "Quarterly": 3, "Half-Yearly": 6, "Annual": 12}
 
 
-def _crm_goal(g: dict, resolved: bool) -> dict:
+def _crm_goal(g: dict, resolved: bool, current_date=None) -> dict:
     """One goals-array entry, keys ordered as in the CRM's example.
 
     resolved=True (successful run): contract shape — start_date_mode is always
@@ -374,9 +397,13 @@ def _crm_goal(g: dict, resolved: bool) -> dict:
     if g.get("description"):
         goal["description"] = g["description"]
     goal["type"] = _TYPE_TO_CRM.get(g.get("type"), g.get("type"))
-    goal["nature"] = g.get("nature")
-    if g.get("nature") != "Replenishing":
-        goal["structure"] = g.get("structure")
+    # §4.4: nature is not an input — export the DERIVED value so the CRM
+    # contract keeps its field without anyone typing it.
+    _derived = goal_purpose(g, pd.Timestamp(current_date) if current_date is not None
+                            else pd.Timestamp.today())
+    goal["nature"] = ("Replenishing" if _derived.startswith("Extends")
+                      else "Non-replenishing")
+    goal["structure"] = g.get("structure")
     recurring = g.get("structure") == "Recurring"
     freq = g.get("frequency")
     if resolved:
@@ -425,11 +452,12 @@ def build_inputs_json(config: dict, retirement_date=None) -> bytes:
                       - float(config.get("current_age", 30)))
         )
         goals_out = [
-            _crm_goal(g, resolved=True)
+            _crm_goal(g, resolved=True, current_date=config["current_date"])
             for g in _resolve_goals(goals_in, pd.Timestamp(retirement_date), death_date)
         ]
     else:
-        goals_out = [_crm_goal(g, resolved=False) for g in goals_in]
+        goals_out = [_crm_goal(g, resolved=False,
+                               current_date=config["current_date"]) for g in goals_in]
     doc = {
         "generated_at": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"),
         "simulation_id": config.get("simulation_id", ""),
@@ -672,7 +700,7 @@ def _goal_outflow_rows(config: dict, resolve_date, death_date) -> tuple[list, fl
         grand += total
         rows.append({
             "name": g.get("name", ""), "type": g.get("type", ""),
-            "nature": g.get("nature", ""), "structure": g.get("structure", ""),
+            "nature": goal_purpose(g, config["current_date"]), "structure": g.get("structure", ""),
             "starts": fmt_mon_yyyy(first) if first is not None else "—",
             "payments": len(tranches),
             "pv": float(g.get("amount", 0) or 0),
@@ -1145,31 +1173,26 @@ def render_goal(g: dict) -> None:
     g["name"] = r1c1.text_input("Name", value=g["name"], key=f"g_name_{uid}")
     g["description"] = r1c2.text_input("Description", value=g["description"], key=f"g_desc_{uid}")
 
-    r2c1, r2c2, r2c3 = st.columns(3)
-    g["nature"] = r2c1.selectbox(
-        "Nature", GOAL_NATURES, index=GOAL_NATURES.index(g["nature"]),
-        key=f"g_nature_{uid}",
-        help="Replenishing = an ongoing payout stream (e.g. retirement income), "
-             "funded via the Debt/Hybrid pools — always Recurring. "
-             "Non-replenishing = a save-up goal provisioned via a glide path; "
-             "it can be a one-time Lumpsum or Recurring (e.g. annual fees).",
+    # v2 (2026-08-24): Nature (Replenishing / Non-replenishing) is NOT an input
+    # any more — it is derived from whether the goal has cashflows beyond the
+    # grid's reach. The two questions that remain are Structure (one-time or
+    # recurring — it decides the cashflow series) and Negotiability, shown as
+    # "Type" (it picks the grid column). See "4. Goal Planning" §4.4.
+    r2c1, r2c2 = st.columns(2)
+    g["structure"] = r2c1.selectbox(
+        "Structure", GOAL_STRUCTURES,
+        index=GOAL_STRUCTURES.index(g["structure"] if g["structure"] in GOAL_STRUCTURES else "Lumpsum"),
+        key=f"g_struct_{uid}",
+        help="Lumpsum = one payment. Recurring = a series — fees, an income "
+             "stream, anything repeating. A goal with both a lump and a stream "
+             "is entered as two goals.",
     )
-    if g["nature"] == "Replenishing":
-        g["structure"] = "Recurring"
-        r2c2.caption("Structure: **Recurring** (always, for Replenishing)")
-    else:
-        g["structure"] = r2c2.selectbox(
-            "Structure", GOAL_STRUCTURES,
-            index=GOAL_STRUCTURES.index(g["structure"] if g["structure"] in GOAL_STRUCTURES else "Lumpsum"),
-            key=f"g_struct_{uid}",
-        )
-    # Type shows for BOTH natures (2026-08-21): the CRM stores a priority on
-    # every goal. The engine reads it only for Non-replenishing goals (glide
-    # sheet selection); on Replenishing goals it is metadata for the exports.
-    g["type"] = r2c3.selectbox(
+    g["type"] = r2c2.selectbox(
         "Type", GOAL_TYPES, index=GOAL_TYPES.index(g["type"]), key=f"g_type_{uid}",
-        help="Goal priority. For Non-replenishing goals it also selects the "
-             "glide-path sheet used to provision the goal.",
+        help="Negotiability. It sets how early the goal is pre-funded and how "
+             "much sits in debt vs hybrid: non-negotiable starts 5 years out, "
+             "semi-negotiable 4, negotiable 3. It also sets funding priority "
+             "when goals compete for the same money.",
     )
 
     r3c1, r3c2 = st.columns([2, 2])
@@ -1211,9 +1234,6 @@ def render_goal(g: dict) -> None:
             g["end_date"] = month_year_input(
                 r5c3, "End date", g["end_date"] or g["start_date"], f"g_end_{uid}"
             )
-        if g["nature"] == "Non-replenishing":
-            st.caption("Non-replenishing recurring goals may span at most 4 years "
-                       "first-to-last payment (engine performance guard).")
 
 
 def render_one_time(w: dict) -> None:
@@ -1245,7 +1265,11 @@ def build_config(personal: dict) -> dict:
             "name": g["name"],
             "description": g["description"] or "",
             "type": g["type"],
-            "nature": g["nature"],
+            # Derived, not asked (§4.4) — kept in the config so saved runs and
+            # the CRM export still carry the field.
+            "nature": ("Replenishing"
+                       if goal_purpose(g, personal["current_date"]).startswith("Extends")
+                       else "Non-replenishing"),
             "structure": g["structure"],
             "start_date_mode": g["start_date_mode"],
             "start_date": None if g["start_date_mode"] == "At retirement" else g["start_date"],
@@ -1759,10 +1783,11 @@ def main() -> None:
     # NB: this engine is no longer the untouched handoff copy — it is the sole
     # Financial Plan build and has deliberate changes on top (DECISIONS.md).
     st.caption(
-        f"Engine `{ENGINE_SOURCE_SHA}` · **updated {ENGINE_UPDATED}** · "
-        f"glide paths v{GLIDEPATH_VERSION} — the sole Financial Plan build, "
-        "forked from the CRM handoff (2026-07-17); every engine change since "
-        "is logged in `v3_docs/DECISIONS.md`."
+        f"Engine `{ENGINE_SOURCE_SHA}` · **updated {ENGINE_UPDATED}** — the "
+        "sole Financial Plan build. Goals are provisioned by the **goal grid** "
+        "(v2): each goal cashflow is pre-funded across debt and hybrid by how "
+        "far away it is and how negotiable the goal is. Every engine change is "
+        "logged in `v3_docs/DECISIONS.md`."
     )
 
     # Sidebar: personal & corpus + risk profile. Defaults come from

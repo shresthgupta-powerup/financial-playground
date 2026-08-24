@@ -32,17 +32,13 @@ from app.planning.engine import (
     _DEFAULT_INSTRUMENT_PARAMS,
     _resolve_recurring_occurrences,
     expand_recurring_goal_to_tranches,
-    compute_replenishing_payouts,
-    net_investment_against_payouts,
-    calculate_goal_cashflows,
-    get_withdrawl_df,
-    add_withdrawls_to_trans,
-    simulate_pool,
     generate_pseudo_nav,
     find_retirement_date,
     run_simulation,
 )
 from app.planning.glide_paths import GLIDEPATH_VERSION, get_glide_paths
+from app.planning.grid_engine import grid_slice_plan
+from app.planning.goal_grid import goal_sleeves
 from app.planning.validation import (
     PlanValidationError,
     validate_plan_config,
@@ -139,56 +135,54 @@ def _parity_config_2():
 
 
 # ===========================================================================
-# (a) Regression golden-master. Retirement/snapshot values RE-BASELINED for the
-#     deliberate 2+2 pool window (engine "1515f1e+pool2x2", operator 2026-06-09);
-#     they no longer match pure-v3 1515f1e. The glide-path tests below remain
-#     genuine v3 parity (glide data is unchanged).
+# (a) Regression golden-master. RE-BASELINED for v2 (the goal grid,
+#     2026-08-24). These are NOT v3/v1 parity any more - v2 provisions goals
+#     from one grid instead of glide-path chains + shared pools, so every
+#     number moves. They exist to freeze v2's behaviour and to make the next
+#     change explain itself.
 # ===========================================================================
 
 class TestParityGoldenMaster:
     def test_glidepath_version_pinned(self):
         assert GLIDEPATH_VERSION == 1
-        assert engine.ENGINE_SOURCE_SHA == (
-            "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe+goaltaxequity")
+        assert engine.ENGINE_SOURCE_SHA == "v2grid+goaltaxequity"
 
     def test_parity_config_1_retirement_date(self):
         res = find_retirement_date(_parity_config_1())
         assert res["success"] is True
-        assert res["retirement_date"] == pd.Timestamp("2032-09-01")
+        assert res["retirement_date"] == pd.Timestamp("2033-01-01")
 
     def test_parity_config_1_snapshot_totals(self):
-        """Golden-master RE-BASELINED for +goaltaxequity (2026-08-24).
+        """Golden-master RE-BASELINED for v2 - the goal GRID (2026-08-24).
 
-        Previously re-baselined for +poolprefund (2026-08-11), before that
-        +monthgrid (Plan 223, 2026-06-17).
+        Previously re-baselined for +goaltaxequity (2026-08-24), +poolprefund
+        (2026-08-11), +monthgrid (Plan 223, 2026-06-17).
 
-        Goal money is now uniformly EQUITY-taxed (the debt sleeve holds
-        arbitrage funds), and a redemption within LTCG_GRACE_DAYS (2) of a
-        full year counts as LTCG (DECISIONS.md 2026-08-24). The binding effect
-        here is the boundary rule: annual glide-path hops and pool refill
-        cycles span 365 days in non-leap years, which the old `<= 365` rule
-        taxed at STCG 20%; they now tax at LTCG 12.5%.
+        v2 replaces glide-path chains AND the shared Debt/Hybrid pools with
+        one grid read per cashflow, so these numbers are a NEW baseline, not a
+        drift from the old one. What changed structurally:
 
-        Retirement date UNCHANGED (2032-09-01) - the saving is too small to
-        move the solver a month.
+        - Provisioning is now per-cashflow and continuous. This config's
+          "Retirement Income" runs 360+ monthly occurrences; v1 funded them
+          from a pool refilled once a year, v2 carves each occurrence off the
+          grid as it enters the 5-year window. len(ft) 137 -> 2649 because
+          every one of those carves is now its own Core->sleeve transaction
+          instead of one annual pool refill.
+        - Retirement 2032-09-01 -> 2033-01-01 (+4 months). v2 provisions
+          MORE: v1's pool sized only a 48-month lookahead, while the grid
+          keeps a rolling 5-year book per cashflow AND taxes each hop it
+          actually takes. Four months is the cost of that honesty.
+        - Amount.sum -424,422,147 -> -440,874,021 (+3.9% gross flow) and
+          tax.sum 53,060,745 -> 55,109,703 (+3.9%): the same money moves in
+          more, smaller steps, and each step is taxed at its own holding
+          period. The two move by the SAME 3.9% - a consistency check.
+        - units.sum 314.00 -> 17.07 and core_last 28,307,534 -> 1,538,606:
+          the terminal residual is a small difference of large numbers, and
+          v2 deliberately leaves less idle in Core (goal money sits in the
+          sleeves that will pay it). debt_last is 2,515,229 - the last
+          sleeve, not yet drawn - so the plan ends funded, not starved.
 
-        Delta attribution (+poolprefund baseline -> +goaltaxequity):
-          len(ft):    138 -> 137  (-1: the FINAL annual "Replenishment: Debt
-                      Pool" event, Sep 2085, disappears - cheaper taxation
-                      leaves the pools slightly richer, so the last year's
-                      injection need is zero and the event is skipped.
-                      Verified by row-level diff on (Date, Description).)
-          Amount.sum: -424,574,896 -> -424,422,147  (+152,750, +0.036%)
-          units.sum:  260.72 -> 314.00  (+20.44%)
-          tax.sum:    53,078,485 -> 53,060,745  (-17,740, -0.033%)
-          Core Corpus Value (last): 23,503,740 -> 28,307,534  (+20.44%)
-
-        units.sum and Core Corpus Value (last) move by the SAME +20.4385%
-        (same quantity, two views) - consistency check PASS. As with prior
-        re-baselines, the terminal residual is a small difference of large
-        numbers, so a 0.036% funding saving compounds into a +20% residual.
-        Every delta is favorable (less outflow, less tax, more residual),
-        which is the only direction this change can move.
+        Both goals still appear in goal_dfs and comp still spans 720 months.
         No unexplained drift - reconciliation PASS.
         """
         cfg = _parity_config_1()
@@ -196,43 +190,41 @@ class TestParityGoldenMaster:
         rd = res["retirement_date"]
         success, ft, fail, pm, gd, comp = run_simulation(cfg, rd, _DEFAULT_INSTRUMENT_PARAMS)
         assert success is True
-        assert len(ft) == 137
-        assert ft["Amount"].sum() == pytest.approx(-424422147.024181, rel=1e-9)
-        assert ft["units"].sum() == pytest.approx(314.0023200459, rel=1e-9)
-        assert ft["tax"].sum() == pytest.approx(53060745.134476, rel=1e-9)
-        assert sorted(gd.keys()) == ["Retirement Home"]
+        assert len(ft) == 2649
+        assert ft["Amount"].sum() == pytest.approx(-440874021.476125, rel=1e-9)
+        assert ft["units"].sum() == pytest.approx(17.0670471315, rel=1e-9)
+        assert ft["tax"].sum() == pytest.approx(55109702.985419, rel=1e-9)
+        assert sorted(gd.keys()) == ["Retirement Home", "Retirement Income"]
         assert len(comp) == 720
-        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(28307533.614697, rel=1e-9)
+        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(1538606.499188, rel=1e-9)
 
     def test_parity_config_2_retirement_date(self):
         res = find_retirement_date(_parity_config_2())
         assert res["success"] is True
-        assert res["retirement_date"] == pd.Timestamp("2028-02-01")
+        assert res["retirement_date"] == pd.Timestamp("2028-05-01")
 
     def test_parity_config_2_snapshot_totals(self):
-        """Golden-master RE-BASELINED for +goaltaxequity (2026-08-24).
+        """Golden-master RE-BASELINED for v2 - the goal GRID (2026-08-24).
 
-        Previously re-baselined for +poolprefund (2026-08-11), before that
-        +monthgrid (Plan 223, 2026-06-17).
+        Same structural change as config 1. This config has two Semi-Negotiable
+        marriage lumpsums plus a 384-occurrence income stream, so it exercises
+        the grid's per-column reach: semi-negotiable goals start provisioning
+        4 years out, not 5.
 
-        Same change as config 1 (uniform equity taxation + LTCG boundary
-        grace). This config's plan is much shorter (33 years of comp vs 60),
-        so fewer annual hops flip from 20% to 12.5% and every delta is
-        smaller.
+        - Retirement 2028-02-01 -> 2028-05-01 (+3 months), the same direction
+          and comparable size to config 1 - cross-config coherence PASS.
+        - len(ft) 64 -> 1557: per-cashflow carves replace annual pool refills.
+        - Amount.sum -88,681,425 -> -93,706,279 (+5.7%); tax.sum 11,129,813
+          -> 11,768,609 (+5.7%). Identical percentages again: more, smaller,
+          individually-taxed movements of the same underlying money.
+        - units.sum 2045.09 -> 3006.07 and core_last 8,626,826 -> 14,074,908
+          rise here (they fell in config 1) because this plan ENDS while its
+          income stream is still running: goal money is still sitting in Core
+          waiting for its window, where config 1's had already been carved.
+          Both are the same mechanism seen at different points in a plan.
 
-        Retirement date UNCHANGED (2028-02-01).
-
-        Delta attribution (+poolprefund baseline -> +goaltaxequity):
-          len(ft):    64 -> 64  (unchanged - no refill event drops out here)
-          Amount.sum: -88,697,219 -> -88,681,425  (+15,794, +0.018%)
-          units.sum:  1941.43 -> 2045.09  (+5.34%)
-          tax.sum:    11,130,370 -> 11,129,813  (-557, -0.005%)
-          Core Corpus Value (last): 8,189,542 -> 8,626,826  (+5.34%)
-
-        units.sum and Core Corpus Value (last) again move by an identical
-        +5.3395% (same quantity, two views) - consistency check PASS. All
-        deltas favorable, same direction as config 1, smaller magnitude for
-        the shorter plan - cross-config coherence PASS.
+        All three goals appear in goal_dfs. comp spans 407 months (v1: 396) -
+        v2 runs to the last cashflow, which is past the death date here.
         No unexplained drift - reconciliation PASS.
         """
         cfg = _parity_config_2()
@@ -240,13 +232,13 @@ class TestParityGoldenMaster:
         rd = res["retirement_date"]
         success, ft, fail, pm, gd, comp = run_simulation(cfg, rd, _DEFAULT_INSTRUMENT_PARAMS)
         assert success is True
-        assert len(ft) == 64  # unchanged under +goaltaxequity
-        assert ft["Amount"].sum() == pytest.approx(-88681424.829336, rel=1e-9)
-        assert ft["units"].sum() == pytest.approx(2045.0897700778, rel=1e-9)
-        assert ft["tax"].sum() == pytest.approx(11129812.822121, rel=1e-9)
-        assert sorted(gd.keys()) == ["Marriage Elder", "Marriage Younger"]
-        assert len(comp) == 396
-        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(8626825.863726, rel=1e-9)
+        assert len(ft) == 1557
+        assert ft["Amount"].sum() == pytest.approx(-93706279.352605, rel=1e-9)
+        assert ft["units"].sum() == pytest.approx(3006.0719124786, rel=1e-9)
+        assert ft["tax"].sum() == pytest.approx(11768609.251287, rel=1e-9)
+        assert sorted(gd.keys()) == ["Marriage Elder", "Marriage Younger", "Retirement Income"]
+        assert len(comp) == 407
+        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(14074908.194281, rel=1e-9)
 
     def test_glide_paths_byte_match_columns(self):
         gp = get_glide_paths()
@@ -339,22 +331,7 @@ class TestCrashClassRepros:
         # Investment covered the SWP → no goal chains (Replenishing) and a clean trans frame.
         assert "Date" in ft.columns
 
-    def test_get_withdrawl_df_empty_is_typed(self):
-        df = get_withdrawl_df({})
-        assert list(df.columns) == ["Date", "Amount", "Description"]
-        assert df.empty
 
-    def test_add_withdrawls_empty_frame_no_keyerror(self):
-        sip = pd.DataFrame({
-            "Date": [TODAY], "Amount": [1_000_000.0], "NAV": [100.0],
-            "units": [10000.0], "Description": ["Current Corpus"],
-        })
-        empty_wd = pd.DataFrame()  # column-less — the original v3 crash trigger
-        out, success, fail = add_withdrawls_to_trans(empty_wd if False else pd.DataFrame(), sip, None, None) \
-            if False else add_withdrawls_to_trans(sip, pd.DataFrame(), None, _DEFAULT_INSTRUMENT_PARAMS)
-        assert success is True
-        assert fail is None
-        assert {"tax", "fully_funded", "shortfall"} <= set(out.columns)
 
 
 # ===========================================================================
@@ -464,149 +441,49 @@ class TestValidation:
 # ===========================================================================
 
 class TestSpanCap:
-    """Boundary matrix for the 4-year (48-month) first-to-last span cap (D-P208-1).
+    """v2 (2026-08-24): the 48-month span cap is RETIRED.
 
-    Implied per-frequency maxima: 5×Annual / 17×Quarterly / 49×Monthly.
+    The cap existed because v1 built one glide-path CHAIN per occurrence, so a
+    long recurring goal exploded into thousands of chains — the cap was an
+    engine performance guard wearing a modelling costume, and it forced real
+    goals (school fees to graduation, a 10-year EMI) to be mis-modelled as
+    "Replenishing". v2 reads each cashflow off one grid and only ever carves
+    the near ones, so length costs nothing and nothing needs re-labelling.
+
+    These cases are the old cap's rejection matrix, now asserted to PASS.
     """
 
-    # -- Annual (freq_months=12) ──────────────────────────────────────────────
-
-    def test_5x_annual_pass(self):
-        """5×Annual → span = (5-1)*12 = 48 months → exactly at cap → allowed."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
+    def _recurring(self, frequency, occurrences, **kw):
+        goal = {
+            "name": "Edu", "type": "Non-Negotiable",
             "structure": "Recurring", "start_date_mode": "Fixed",
             "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-            "frequency": "Annual", "occurrences": 5,
+            "frequency": frequency, "occurrences": occurrences,
             "end_mode": "Occurrences", "inflation_percent": 6.0,
-        }])
-        validate_plan_config(cfg)  # 48 months == cap → allowed
+        }
+        goal.update(kw)
+        return _base_config(goals=[goal])
 
-    def test_6x_annual_fail(self):
-        """6×Annual → span = (6-1)*12 = 60 months > 48 → rejected."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-            "frequency": "Annual", "occurrences": 6,
-            "end_mode": "Occurrences", "inflation_percent": 6.0,
-        }])
-        with pytest.raises(PlanValidationError, match="4 years"):
-            validate_plan_config(cfg)
+    def test_6x_annual_now_valid(self):
+        validate_plan_config(self._recurring("Annual", 6))       # was: rejected
 
-    # -- Monthly (freq_months=1) ──────────────────────────────────────────────
+    def test_50x_monthly_now_valid(self):
+        validate_plan_config(self._recurring("Monthly", 50))     # was: rejected
 
-    def test_49x_monthly_pass(self):
-        """49×Monthly → span = (49-1)*1 = 48 months → exactly at cap → allowed."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-            "frequency": "Monthly", "occurrences": 49,
-            "end_mode": "Occurrences", "inflation_percent": 6.0,
-        }])
-        validate_plan_config(cfg)  # 48 months == cap → allowed
+    def test_fixed_date_49mo_now_valid(self):
+        validate_plan_config(self._recurring(
+            "Monthly", None, end_mode="Fixed date",
+            end_date=pd.Timestamp("2034-02-01")))                # was: rejected
 
-    def test_50x_monthly_fail(self):
-        """50×Monthly → span = (50-1)*1 = 49 months > 48 → rejected."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-            "frequency": "Monthly", "occurrences": 50,
-            "end_mode": "Occurrences", "inflation_percent": 6.0,
-        }])
-        with pytest.raises(PlanValidationError, match="4 years"):
-            validate_plan_config(cfg)
+    def test_lifetime_recurring_now_valid(self):
+        """A lifetime stream is just a goal most of whose cashflows sit beyond
+        the window — derived as replenishing, not a validation error."""
+        validate_plan_config(self._recurring(
+            "Monthly", None, end_mode="Lifetime"))               # was: rejected
 
-    # -- Quarterly (freq_months=3) ────────────────────────────────────────────
-
-    def test_17x_quarterly_pass(self):
-        """17×Quarterly → span = (17-1)*3 = 48 months → exactly at cap → allowed."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-            "frequency": "Quarterly", "occurrences": 17,
-            "end_mode": "Occurrences", "inflation_percent": 6.0,
-        }])
-        validate_plan_config(cfg)
-
-    # -- Fixed-date mode ──────────────────────────────────────────────────────
-
-    def test_fixed_date_48mo_pass(self):
-        """Fixed-date 48-month gap → exactly at cap → allowed."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"),
-            "end_date": pd.Timestamp("2034-01-01"),  # 48 months
-            "amount": 100_000,
-            "frequency": "Monthly", "end_mode": "Fixed date", "inflation_percent": 6.0,
-        }])
-        validate_plan_config(cfg)
-
-    def test_fixed_date_49mo_fail(self):
-        """Fixed-date 49-month gap → 1 month over cap → rejected."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"),
-            "end_date": pd.Timestamp("2034-02-01"),  # 49 months
-            "amount": 100_000,
-            "frequency": "Monthly", "end_mode": "Fixed date", "inflation_percent": 6.0,
-        }])
-        with pytest.raises(PlanValidationError, match="4 years"):
-            validate_plan_config(cfg)
-
-    # -- Lifetime mode ────────────────────────────────────────────────────────
-
-    def test_lifetime_nonreplenishing_rejected(self):
-        """Lifetime end_mode on a non-replenishing goal → unconditional violation."""
-        cfg = _base_config(goals=[{
-            "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-            "frequency": "Monthly", "end_mode": "Lifetime", "inflation_percent": 6.0,
-        }])
-        with pytest.raises(PlanValidationError):
-            validate_plan_config(cfg)
-
-    # -- Replenishing stays uncapped ──────────────────────────────────────────
-
-    def test_replenishing_recurring_uncapped(self):
-        """Replenishing recurring goals are never subject to the span cap."""
-        cfg = _base_config(goals=[{
-            "name": "Income", "type": "Non-Negotiable", "nature": "Replenishing",
-            "structure": "Recurring", "start_date_mode": "Fixed",
-            "start_date": pd.Timestamp("2030-01-01"), "amount": 50_000,
-            "frequency": "Monthly", "end_mode": "Lifetime", "inflation_percent": 6.0,
-        }])
-        validate_plan_config(cfg)  # no raise — replenishing is uncapped
-
-    # -- Perf timing at new worst case (49×Monthly, D-P208-2) ─────────────────
-
-    def test_worst_case_run_simulation_49_monthly_under_budget(self):
-        """Worst case single run_simulation at 49×Monthly (the new span cap) stays
-        under ~3s (D-P208-2).
-
-        49 non-replenishing monthly chains = worst acceptable case under the span cap.
-        """
-        cfg = _base_config(
-            current_corpus=200_000_000,
-            target_lifetime=90,
-            goals=[{
-                "name": "Edu", "type": "Non-Negotiable", "nature": "Non-replenishing",
-                "structure": "Recurring", "start_date_mode": "Fixed",
-                "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000,
-                "frequency": "Monthly", "occurrences": 49,
-                "end_mode": "Occurrences", "inflation_percent": 6.0,
-            }],
-        )
-        t0 = time.perf_counter()
-        success, ft, *_ = run_simulation(cfg, TODAY, _DEFAULT_INSTRUMENT_PARAMS)
-        elapsed = time.perf_counter() - t0
-        assert elapsed < 3.0, f"worst-case run_simulation took {elapsed:.2f}s (budget 3s)"
+    def test_still_valid_cases_stay_valid(self):
+        for freq, occ in (("Annual", 5), ("Monthly", 49), ("Quarterly", 17)):
+            validate_plan_config(self._recurring(freq, occ))
 
 
 # ===========================================================================
@@ -725,62 +602,12 @@ class TestExpandTranches:
 # (e) compute_replenishing_payouts + net_investment_against_payouts.
 # ===========================================================================
 
-class TestPayoutsAndNetting:
-    def test_compute_replenishing_payouts_empty(self):
-        df = compute_replenishing_payouts([], TODAY)
-        assert list(df.columns) == ["Date", "Amount"]
-        assert df.empty
-
-    def test_compute_replenishing_only_replenishing(self):
-        goals = [
-            {"name": "A", "nature": "Replenishing", "structure": "Recurring", "frequency": "Annual",
-             "occurrences": 2, "start_date": pd.Timestamp("2030-01-01"), "amount": 100_000, "inflation_percent": 0.0},
-            {"name": "B", "nature": "Non-replenishing", "structure": "Lumpsum",
-             "start_date": pd.Timestamp("2030-01-01"), "amount": 999, "inflation_percent": 0.0},
-        ]
-        df = compute_replenishing_payouts(goals, TODAY)
-        assert len(df) == 2  # only the replenishing goal's 2 occurrences
-        assert df["Amount"].sum() == pytest.approx(200_000)
-
-    def test_netting_investment_covers_payout(self):
-        inv = pd.DataFrame({"Date": [pd.Timestamp("2030-01-01")], "Investment": [100_000.0]})
-        pay = pd.DataFrame({"Date": [pd.Timestamp("2030-01-01")], "Amount": [40_000.0]})
-        net, surplus = net_investment_against_payouts(inv, pay, TODAY)
-        assert net.empty  # investment fully covered the payout
-        assert surplus["Investment"].iloc[0] == pytest.approx(60_000)
-
-    def test_netting_payout_exceeds_investment(self):
-        inv = pd.DataFrame({"Date": [pd.Timestamp("2030-01-01")], "Investment": [30_000.0]})
-        pay = pd.DataFrame({"Date": [pd.Timestamp("2030-01-01")], "Amount": [100_000.0]})
-        net, surplus = net_investment_against_payouts(inv, pay, TODAY)
-        assert net["Amount"].iloc[0] == pytest.approx(70_000)
-        assert surplus["Investment"].iloc[0] == pytest.approx(0)
 
 
 # ===========================================================================
 # (e) calculate_goal_cashflows — chain back-solve for all 3 glide types.
 # ===========================================================================
 
-class TestGoalCashflows:
-    @pytest.mark.parametrize("gtype", ["Non-Negotiable", "Semi-Negotiable", "Negotiable"])
-    def test_chain_back_solve_each_glide_type(self, gtype):
-        gp = get_glide_paths()
-        cfg = {"current_date": TODAY}
-        out = calculate_goal_cashflows(
-            input_df=gp[gtype],
-            end_date=pd.Timestamp("2040-01-01"),
-            goal_value_post_tax=10_000_000,
-            instrument_params=_DEFAULT_INSTRUMENT_PARAMS,
-            input_variables=cfg,
-        )
-        # goal rows' inflow_amount sums to the post-tax goal target
-        goal_inflow = out[out["place"] == "goal"]["inflow_amount"].sum()
-        assert goal_inflow == pytest.approx(10_000_000, rel=1e-6)
-        # core-corpus sourced rows must each provide positive principal
-        cc_rows = out[out["inflow_from"] == "core corpus"]
-        assert (cc_rows["inflow_amount"] > 0).all()
-        # back-solved core-corpus principal is < goal value (instruments grow it)
-        assert cc_rows["inflow_amount"].sum() < 10_000_000
 
 
 # ===========================================================================
@@ -793,27 +620,7 @@ class TestSimulatePool:
         hybrid = generate_pseudo_nav(TODAY, pd.Timestamp(end), 0.10)
         return debt, hybrid
 
-    def test_empty_payouts_no_pool(self):
-        debt, hybrid = self._navs()
-        empty = pd.DataFrame({"Date": pd.Series(dtype="datetime64[ns]"), "Amount": pd.Series(dtype=float)})
-        pt, cr, fd, fr, pm = simulate_pool(
-            empty, debt, hybrid, _DEFAULT_INSTRUMENT_PARAMS["debt"],
-            _DEFAULT_INSTRUMENT_PARAMS["hybrid"], TODAY, pd.Timestamp("2040-01-01"))
-        assert fd is None
-        assert pt.empty
 
-    def test_pool_funds_payouts_with_core_refill(self):
-        debt, hybrid = self._navs()
-        payouts = pd.DataFrame({
-            "Date": pd.to_datetime(["2027-01-01", "2027-02-01", "2027-03-01"]),
-            "Amount": [50_000.0, 50_000.0, 50_000.0],
-        })
-        pt, cr, fd, fr, pm = simulate_pool(
-            payouts, debt, hybrid, _DEFAULT_INSTRUMENT_PARAMS["debt"],
-            _DEFAULT_INSTRUMENT_PARAMS["hybrid"], pd.Timestamp("2027-01-01"), pd.Timestamp("2040-01-01"))
-        assert fd is None  # funded via core replenishments
-        assert not cr.empty  # core had to refill the debt pool
-        assert not pm.empty
 
 
 # ===========================================================================
@@ -1365,3 +1172,268 @@ class TestMonthGridInvariant:
         assert res["success"] is True
         rd = res["retirement_date"]
         assert rd.day == 1, f"retirement_date must be on the 1st; got {rd}"
+
+
+# ===========================================================================
+# (v2) THE GOAL GRID — provisioning + settlement (DECISIONS.md 2026-08-24).
+#
+# These replace the v1 chain/pool tests (TestSimulatePool, TestGoalCashflows'
+# chain back-solve, TestPayoutsAndNetting's compute_replenishing_payouts /
+# net_investment_against_payouts): those functions no longer exist. What they
+# were really asserting — payouts get funded, income offsets them first, money
+# de-risks as the goal nears — is asserted here against the grid instead.
+# ===========================================================================
+
+def _grid_config(goals, corpus=50_000_000, streams=None, current_date=None,
+                 current_age=40, target_lifetime=90):
+    return {
+        "current_date": current_date or TODAY,
+        "current_age": current_age, "target_lifetime": target_lifetime,
+        "current_corpus": corpus,
+        "investment_streams": streams or [],
+        "goals": goals, "one_time_investments": [],
+    }
+
+
+def _goal(name="Car", type_="Non-Negotiable", structure="Lumpsum",
+          start=None, amount=1_000_000, inflation=8.0, **kw):
+    g = {"name": name, "type": type_, "structure": structure,
+         "start_date_mode": "Fixed", "start_date": start or pd.Timestamp("2031-10-01"),
+         "amount": amount, "inflation_percent": inflation}
+    g.update(kw)
+    return g
+
+
+class TestGridSlicePlan:
+    """The grid's shares become dated funding events with real routes."""
+
+    def test_non_negotiable_five_year_shape(self):
+        # 25% enters each year from 5y out; the 4-5y slice is the only hybrid
+        # one, and it CONVERTS to debt when the final (0-1y) row arrives.
+        plan = grid_slice_plan("non-negotiable", pd.Timestamp("2031-10-01"), TODAY)
+        assert [round(s["share"], 10) for s in plan] == [0.25, 0.25, 0.25, 0.25]
+        assert plan[0]["hops"][0][0] == "hybrid"
+        assert plan[0]["hops"][1][0] == "debt"          # the conversion
+        assert all(len(s["hops"]) == 1 and s["hops"][0][0] == "debt"
+                   for s in plan[1:])
+
+    def test_shares_sum_to_the_column_total(self):
+        # Each column's shares must sum to its own 0-1yr row total: the goal is
+        # fully provisioned by its date (non-neg 100%), and less-negotiable
+        # goals are provisioned less (semi 100%, neg 100% — all reach 100% at
+        # t=0 in this grid; the difference is WHEN, not how much).
+        for neg in ("non-negotiable", "semi-negotiable", "negotiable"):
+            plan = grid_slice_plan(neg, pd.Timestamp("2031-10-01"), TODAY)
+            assert sum(s["share"] for s in plan) == pytest.approx(1.0)
+
+    def test_reach_clips_the_start_row(self):
+        # A negotiable goal reaches 3 years, so nothing is carved before then
+        # even though the cashflow is 5 years out: its first entry month is
+        # ~3 years away, not ~5.
+        far = pd.Timestamp("2031-10-01")
+        neg_plan = grid_slice_plan("negotiable", far, TODAY)
+        non_plan = grid_slice_plan("non-negotiable", far, TODAY)
+        assert min(s["hops"][0][1] for s in neg_plan) > \
+               min(s["hops"][0][1] for s in non_plan)
+
+    def test_late_plan_catches_up_in_one_event(self):
+        # A goal already inside its final year has no runway: the whole 100%
+        # enters at the plan start rather than gliding.
+        soon = TODAY + pd.DateOffset(months=6)
+        plan = grid_slice_plan("non-negotiable", soon, TODAY)
+        assert len(plan) == 1
+        assert plan[0]["share"] == pytest.approx(1.0)
+        assert pd.Timestamp(plan[0]["hops"][0][1]) == TODAY
+
+
+class TestGridFundsGoalsExactly:
+    """Path-consistent sizing: the goal receives its FV, net of every tax."""
+
+    def test_lumpsum_goal_paid_to_the_rupee(self):
+        cf = pd.Timestamp("2031-10-01")
+        cfg = _grid_config([_goal(start=cf, amount=1_000_000, inflation=8.0)])
+        ok, _ft, fail, _pm, goal_dfs, _comp = run_simulation(
+            cfg, pd.Timestamp("2040-01-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is True and fail is None
+        t = (cf - TODAY).days / 365.25
+        target_fv = 1_000_000 * (1.08 ** t)
+        gdf = goal_dfs["Car"]
+        paid = gdf[gdf["place"] == "goal"]["inflow_amount"].sum()
+        assert paid == pytest.approx(target_fv, abs=1.0)
+
+    def test_sizing_is_path_consistent_not_doc_literal(self):
+        """The hybrid slice is sized for the route it TRAVELS (hybrid then debt).
+
+        The doc's formula discounts the hybrid share at hybrid growth for the
+        whole distance; the grid actually moves that money into debt for the
+        final year, and taxes the switch. Sizing must follow the real route —
+        so the principal is HIGHER than the doc-literal figure (operator
+        decision, 2026-08-24; goal_grid.invest_today keeps the doc behaviour).
+        """
+        cf = pd.Timestamp("2031-10-01")
+        cfg = _grid_config([_goal(start=cf, amount=1_000_000, inflation=8.0)])
+        _ok, _ft, _f, _pm, goal_dfs, _c = run_simulation(
+            cfg, pd.Timestamp("2040-01-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        gdf = goal_dfs["Car"]
+        hybrid_entry = gdf[(gdf["inflow_from"] == "core corpus")
+                           & (gdf["place"] == "hybrid")]
+        assert len(hybrid_entry) == 1
+        engine_principal = float(hybrid_entry.iloc[0]["inflow_amount"])
+
+        entry_date = pd.Timestamp(hybrid_entry.iloc[0]["inflow_date"])
+        t_entry = (cf - entry_date).days / 365.25
+        t_plan = (cf - TODAY).days / 365.25
+        fv = 1_000_000 * (1.08 ** t_plan)
+        doc_literal = (fv * 0.25) / (1.10 ** t_entry)     # never taxed, never switched
+        assert engine_principal > doc_literal
+        assert engine_principal == pytest.approx(doc_literal * 1.10, rel=0.06)
+
+    def test_recurring_goal_every_occurrence_paid(self):
+        cfg = _grid_config([_goal(
+            name="Fees", structure="Recurring", start=pd.Timestamp("2029-04-01"),
+            amount=500_000, inflation=10.0, frequency="Annual",
+            occurrences=4, end_mode="Occurrences")])
+        ok, _ft, fail, _pm, goal_dfs, _c = run_simulation(
+            cfg, pd.Timestamp("2040-01-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is True and fail is None
+        gdf = goal_dfs["Fees"]
+        goal_rows = gdf[gdf["place"] == "goal"]
+        assert goal_rows["inflow_date"].nunique() == 4
+        for d, grp in goal_rows.groupby("inflow_date"):
+            t = (pd.Timestamp(d) - TODAY).days / 365.25
+            assert grp["inflow_amount"].sum() == pytest.approx(
+                500_000 * (1.10 ** t), abs=1.0)
+
+
+class TestGridDynamics:
+    """Decisions of 2026-08-24: monthly Core re-read, derived purpose."""
+
+    def test_long_income_is_replenishing_and_funds_rollingly(self):
+        # 487 monthly occurrences: only the near ones are ever carved; the rest
+        # stay Core's job until their window arrives. The plan must still pay
+        # every one of them, and the sleeves must keep refilling for decades.
+        income = _goal(name="Retirement Income", structure="Recurring",
+                       start=pd.Timestamp("2026-09-01"), amount=125_000,
+                       inflation=6.0, frequency="Monthly", occurrences=487,
+                       end_mode="Occurrences")
+        sleeves = goal_sleeves(income, TODAY, apply_tax=False)
+        assert sleeves["purpose"] == "GOAL_REPLENISH"
+        assert sleeves["beyond"] > sleeves["inside"] > 0
+
+        cfg = _grid_config([income], corpus=200_000_000,
+                           current_age=60, target_lifetime=100)
+        ok, _ft, fail, _pm, _gd, comp = run_simulation(
+            cfg, pd.Timestamp("2026-09-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is True and fail is None
+        # Sleeves are alive in the middle of the plan, not only at the start —
+        # this is the monthly re-read against Core doing its job.
+        mid = comp.iloc[len(comp) // 2]
+        assert mid["Debt Pool Value"] > 0
+
+    def test_short_recurring_goal_is_not_replenishing(self):
+        # "Recurring is not the same as replenishing" — 8 quarterly payouts
+        # inside two years are fully funded now.
+        g = _goal(name="Fees", structure="Recurring",
+                  start=TODAY + pd.DateOffset(months=3), amount=100_000,
+                  frequency="Quarterly", occurrences=8, end_mode="Occurrences")
+        assert goal_sleeves(g, TODAY, apply_tax=False)["purpose"] == "GOAL_NON_REPLENISH"
+
+    def test_nature_input_is_ignored(self):
+        """`nature` is no longer an input — the same goal plans identically
+        whether it is labelled Replenishing, Non-replenishing, or nothing."""
+        cf = pd.Timestamp("2031-10-01")
+        outs = []
+        for nature in ("Replenishing", "Non-replenishing", None):
+            g = _goal(start=cf)
+            if nature is not None:
+                g["nature"] = nature
+            _ok, _ft, _f, _pm, gd, _c = run_simulation(
+                _grid_config([g]), pd.Timestamp("2040-01-01"),
+                _DEFAULT_INSTRUMENT_PARAMS)
+            outs.append(gd["Car"]["inflow_amount"].sum())
+        assert outs[0] == pytest.approx(outs[1]) == pytest.approx(outs[2])
+
+    def test_income_nets_against_due_cashflows_untaxed(self):
+        """Income funds a due cashflow directly — no sleeve, no tax, no carve.
+
+        A goal fully covered by that month's income needs no provisioning at
+        all, so it produces no Core->bucket rows.
+        """
+        due = TODAY + pd.DateOffset(months=6)
+        stream = {"name": "Salary", "amount": 5_000_000, "start_date": TODAY,
+                  "end_date_mode": "Fixed", "end_date": pd.Timestamp("2040-01-01"),
+                  "step_up_percent": 0.0, "step_up_frequency": "Annual",
+                  "step_up_date": TODAY}
+        cfg = _grid_config([_goal(start=due, amount=1_000_000)],
+                           corpus=1_000_000, streams=[stream])
+        ok, _ft, fail, _pm, goal_dfs, _c = run_simulation(
+            cfg, pd.Timestamp("2040-01-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is True and fail is None
+        assert goal_dfs == {} or goal_dfs["Car"].empty
+
+
+class TestGridFailureSemantics:
+    """Failure means ALL pools are depleted — nothing weaker (decision #3)."""
+
+    def test_failure_only_when_everything_is_empty(self):
+        income = _goal(name="Retirement Income", structure="Recurring",
+                       start=pd.Timestamp("2026-09-01"), amount=125_000,
+                       inflation=6.0, frequency="Monthly", occurrences=487,
+                       end_mode="Occurrences")
+        cfg = _grid_config([income], corpus=5_000_000,
+                           current_age=60, target_lifetime=100)
+        ok, _ft, fail, _pm, _gd, comp = run_simulation(
+            cfg, pd.Timestamp("2026-09-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is False
+        assert "All pools depleted" in fail["description"]
+        row = comp[comp["Date"] >= pd.Timestamp(fail["date"])].iloc[0]
+        assert row["Core Corpus Value"] == pytest.approx(0, abs=1.0)
+        assert row["Debt Pool Value"] == pytest.approx(0, abs=1.0)
+        assert row["Hybrid Pool Value"] == pytest.approx(0, abs=1.0)
+
+    def test_core_short_of_a_provisioning_event_is_not_failure(self):
+        """A month Core cannot fully provision is a RETRY, not a failure.
+
+        Corpus is small at the plan start but a large income stream arrives
+        later, well before the goal is due: the slice re-sizes and completes in
+        a later month, and the plan succeeds.
+        """
+        cf = TODAY + pd.DateOffset(years=4)
+        stream = {"name": "Salary", "amount": 400_000, "start_date": TODAY,
+                  "end_date_mode": "Fixed", "end_date": cf,
+                  "step_up_percent": 0.0, "step_up_frequency": "Annual",
+                  "step_up_date": TODAY}
+        cfg = _grid_config([_goal(start=cf, amount=10_000_000, inflation=6.0)],
+                           corpus=100_000, streams=[stream])
+        ok, _ft, fail, _pm, _gd, _c = run_simulation(
+            cfg, pd.Timestamp("2040-01-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is True and fail is None
+
+    def test_a_goal_may_raid_another_goals_sleeve_before_failing(self):
+        """Sequential funding means the LAST-priority goal gives money up.
+
+        Two goals due the same month with only enough for one: the plan drains
+        the negotiable goal's sleeve to pay the non-negotiable one, so the
+        failure (if any) is reported against the negotiable goal, never the
+        non-negotiable one.
+        """
+        due = TODAY + pd.DateOffset(years=3)
+        goals = [_goal(name="Must", type_="Non-Negotiable", start=due,
+                       amount=5_000_000, inflation=6.0),
+                 _goal(name="Maybe", type_="Negotiable", start=due,
+                       amount=5_000_000, inflation=6.0)]
+        cfg = _grid_config(goals, corpus=6_000_000)
+        ok, _ft, fail, _pm, _gd, _c = run_simulation(
+            cfg, pd.Timestamp("2040-01-01"), _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is False
+        assert "Maybe" in fail["description"]
+
+
+class TestGridLongRecurringIsValidNow:
+    """The 48-month non-replenishing span cap is retired with the chains."""
+
+    def test_long_recurring_goal_validates(self):
+        g = _goal(name="School Fees", structure="Recurring",
+                  start=pd.Timestamp("2029-04-01"), amount=300_000,
+                  frequency="Annual", occurrences=12, end_mode="Occurrences")
+        validate_plan_config(_grid_config([g]))  # no raise

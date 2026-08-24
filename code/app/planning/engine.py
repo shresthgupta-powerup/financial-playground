@@ -22,6 +22,15 @@ from dateutil.relativedelta import relativedelta
 
 from .glide_paths import get_glide_paths
 from .validation import validate_plan_config
+from .goal_grid import normalise_negotiability
+from .grid_engine import (
+    _NEG_RANK,
+    _PAY_TOLERANCE,
+    chain_table_rows,
+    grid_slice_plan,
+    net_tranches_against_income,
+    slice_principal,
+)
 
 # Engine version stamped on saved plans (reproducibility, D-P206-3/6).
 # "1515f1e" = the v3 source the engine was ported from; the "+pool2x2" suffix
@@ -31,7 +40,10 @@ from .validation import validate_plan_config
 # coercion (all input dates snapped to day=1, step-up anchor -> current_date).
 # Bump this whenever the engine's numeric behaviour changes, so two saved plans
 # with the same stamp always reproduce.
-ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe+goaltaxequity"
+# v2 (2026-08-24): the goal GRID replaces glide-path chains and shared pools.
+# v1 lineage "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe
+# +goaltaxequity" is retired; git history holds it. DECISIONS.md 2026-08-24.
+ENGINE_SOURCE_SHA = "v2grid+goaltaxequity"
 # Bump alongside ENGINE_SOURCE_SHA - shown in the app header as "updated ...".
 ENGINE_UPDATED = "2026-08-24"
 
@@ -49,13 +61,6 @@ LTCG_GRACE_DAYS = 2
 _STCG_MAX_DAYS = 365 - LTCG_GRACE_DAYS          # held <= 363 days -> STCG
 _STCG_MAX_YEARS = _STCG_MAX_DAYS / 365.25       # same rule for fractional-year legs
 
-# Pool pre-funding horizon (2026-08-11, "+poolprefund"). The Debt/Hybrid pools
-# now begin provisioning up to this many months BEFORE the first net payout
-# instead of on the payout date itself. 48 = the pools' own horizon (Debt covers
-# months 0-24, Hybrid 25-48), so the existing lookahead windows convert the
-# earlier start into a graduated ramp with no other change. See the
-# 2026-08-11 entry in v3_docs/DECISIONS.md.
-POOL_PREFUND_MONTHS = 48
 
 # ---------------------------------------------------------------------------
 # All Date columns / Timestamps must use a single resolution to avoid
@@ -391,83 +396,8 @@ def expand_recurring_goal_to_tranches(goal, current_date):
     return tranches
 
 
-def compute_replenishing_payouts(goals, current_date):
-    """Return a ``[Date, Amount]`` DataFrame summing every Replenishing goal's payouts."""
-    rows = []
-    for goal in goals:
-        if str(goal.get('nature', '')).lower() != 'replenishing':
-            continue
-        for d, amt in expand_recurring_goal_to_tranches(goal, current_date):
-            rows.append({'Date': pd.Timestamp(d), 'Amount': float(amt)})
-    if not rows:
-        empty = pd.DataFrame({'Date': pd.Series(dtype=_NS_DTYPE), 'Amount': pd.Series(dtype=float)})
-        return empty
-    df = pd.DataFrame(rows)
-    df = df.groupby('Date', as_index=False)['Amount'].sum()
-    df['Date'] = df['Date'].astype(_NS_DTYPE)
-    return df.sort_values('Date').reset_index(drop=True)
 
 
-def net_investment_against_payouts(investment_df, payouts_df, current_date):
-    """Net monthly Investment streams against Replenishing payouts — aggregate, per calendar month.
-
-    Each month: total investment funds that month's total Replenishing payouts *first*. Only the
-    **balance** (``max(0, payout - investment)``) is left for the pool to fund, and only **surplus**
-    investment (``max(0, investment - payout)``) is invested into the Core Corpus. The investment used
-    to cover a payout bypasses the corpus entirely — it is cash paying an expense, so it incurs no
-    equity cap-gains tax.
-
-    Single corpus, single Debt/Hybrid pool, one total-investment figure per month — there is no
-    stream->goal matching.
-
-    Returns ``(net_payouts_df, surplus_investment_df)``:
-      - ``net_payouts_df``  ``[Date, Amount]`` — the payout balance the pool must fund. One row per
-        original payout date, reduced by that month's investment; only rows with ``Amount > 0`` survive.
-      - ``surplus_investment_df`` ``[Date, Investment]`` — investment left after covering that month's
-        payouts, the only investment routed into the Core Corpus.
-    """
-    investment_df = investment_df if investment_df is not None else pd.DataFrame({'Date': [], 'Investment': []})
-    payouts_df = payouts_df if payouts_df is not None else pd.DataFrame({'Date': [], 'Amount': []})
-
-    inc = investment_df.copy()
-    if inc.empty:
-        investment_by_month = {}
-    else:
-        inc['ym'] = inc['Date'].dt.to_period('M')
-        investment_by_month = inc.groupby('ym')['Investment'].sum().to_dict()
-
-    # Investment left in each month, decremented as it funds payouts in date order.
-    remaining = dict(investment_by_month)
-
-    net_rows = []
-    if not payouts_df.empty:
-        for _, r in payouts_df.sort_values('Date').iterrows():
-            ym = pd.Timestamp(r['Date']).to_period('M')
-            avail = remaining.get(ym, 0.0)
-            gross = float(r['Amount'])
-            used = min(avail, gross)
-            remaining[ym] = avail - used
-            net = gross - used
-            if net > 1e-6:
-                net_rows.append({'Date': pd.Timestamp(r['Date']), 'Amount': net})
-
-    if net_rows:
-        net_payouts_df = _ensure_date_ns(pd.DataFrame(net_rows))
-        net_payouts_df = net_payouts_df.sort_values('Date').reset_index(drop=True)
-    else:
-        net_payouts_df = pd.DataFrame({'Date': pd.Series(dtype=_NS_DTYPE), 'Amount': pd.Series(dtype=float)})
-
-    # Surplus investment per month = whatever investment is left after funding that month's payouts.
-    if inc.empty:
-        surplus_investment_df = _ensure_date_ns(pd.DataFrame({'Date': [pd.Timestamp(current_date)], 'Investment': [0.0]}))
-    else:
-        surplus_rows = [
-            {'Date': r['Date'], 'Investment': max(0.0, remaining.get(r['Date'].to_period('M'), float(r['Investment'])))}
-            for _, r in inc.iterrows()
-        ]
-        surplus_investment_df = _ensure_date_ns(pd.DataFrame(surplus_rows))
-
-    return net_payouts_df, surplus_investment_df
 
 
 def generate_pseudo_nav(start_date, end_date, rate_of_return):
@@ -486,111 +416,6 @@ def generate_pseudo_nav(start_date, end_date, rate_of_return):
 
 # --- Core Calculation Functions ---
 
-def calculate_goal_cashflows(input_df, end_date, goal_value_post_tax, instrument_params, input_variables):
-    current_date = input_variables['current_date']
-    df = input_df.copy()
-    end_date = pd.Timestamp(end_date)
-    df['place'] = df['place'].str.lower()
-
-    df['inflow_date'] = df['years from inflow till end'].apply(
-        lambda years: end_date - relativedelta(years=int(years))
-    )
-
-    df['outflow_date'] = df['years from outflow till end'].apply(
-        lambda x: end_date - relativedelta(years=int(x)) if pd.notna(x) else pd.NaT
-    )
-
-    df['inflow_date'] = df['inflow_date'].astype(_NS_DTYPE)
-    df['outflow_date'] = pd.to_datetime(df['outflow_date']).astype(_NS_DTYPE)
-
-    df[['inflow_date', 'outflow_date']] = df[['inflow_date', 'outflow_date']].mask(
-        df[['inflow_date', 'outflow_date']] < current_date,
-        current_date
-    )
-
-    df['goal_value_post_tax'] = goal_value_post_tax
-    df['inflow_amount'] = 0.0
-    id_to_idx = {row['id']: idx for idx, row in df.iterrows()}
-
-    def calculate_required_inflow(target_post_tax, annual_return, tax_rate, years):
-        if years == 0:
-            return target_post_tax
-        growth_factor = (1 + annual_return) ** years
-        multiplier = growth_factor * (1 - tax_rate) + tax_rate
-        return target_post_tax / multiplier
-
-    def process_chain(goal_row_id):
-        current_id = goal_row_id
-        current_idx = id_to_idx[current_id]
-        current_row = df.loc[current_idx]
-
-        target_amount = current_row['goal_value_post_tax'] * (current_row['% of goal value'] / 100)
-        df.at[current_idx, 'inflow_amount'] = target_amount
-
-        while True:
-            current_idx = id_to_idx[current_id]
-            current_row = df.loc[current_idx]
-            inflow_from = current_row['inflow_from']
-
-            if inflow_from == 'core corpus':
-                break
-
-            source_idx = id_to_idx[inflow_from]
-            source_row = df.loc[source_idx]
-
-            inflow_date = source_row['inflow_date']
-            outflow_date = current_row['inflow_date']
-            years = (outflow_date - inflow_date).days / 365.25
-
-            place = source_row['place'].lower()
-            params = instrument_params.get(place, {'return': 0.0, 'stcg_tax': 0.0, 'ltcg_tax': 0.0})
-            tax_rate = params['stcg_tax'] if years <= _STCG_MAX_YEARS else params['ltcg_tax']
-
-            target_for_source = df.at[current_idx, 'inflow_amount']
-            required_inflow = calculate_required_inflow(
-                target_for_source, params['return'], tax_rate, years
-            )
-
-            df.at[source_idx, 'inflow_amount'] = required_inflow
-            current_id = inflow_from
-
-    goal_rows = df[df['place'] == 'goal']
-    for _, goal_row in goal_rows.iterrows():
-        process_chain(goal_row['id'])
-
-    df['inflow_amount'] = df['inflow_amount'].round(2)
-    df['total_outflow_amount'] = 0.0
-    df['tax_out_of_outflow'] = 0.0
-
-    for idx, row in df.iterrows():
-        if row['place'] == 'goal':
-            df.at[idx, 'total_outflow_amount'] = pd.NA
-            df.at[idx, 'tax_out_of_outflow'] = pd.NA
-            continue
-
-        place = row['place'].lower()
-        params = instrument_params.get(place, {'return': 0.0, 'stcg_tax': 0.0, 'ltcg_tax': 0.0})
-
-        if pd.notna(row['outflow_date']):
-            years = (row['outflow_date'] - row['inflow_date']).days / 365.25
-            principal = row['inflow_amount']
-            total_outflow = principal * ((1 + params['return']) ** years)
-            gains = total_outflow - principal
-            tax_rate = params['stcg_tax'] if years <= _STCG_MAX_YEARS else params['ltcg_tax']
-            tax = gains * tax_rate
-
-            df.at[idx, 'total_outflow_amount'] = round(total_outflow, 2)
-            df.at[idx, 'tax_out_of_outflow'] = round(tax, 2)
-        else:
-            df.at[idx, 'total_outflow_amount'] = pd.NA
-            df.at[idx, 'tax_out_of_outflow'] = pd.NA
-
-    output_columns = [
-        'id', 'place', 'inflow_date', 'outflow_date', 'inflow_from',
-        'outflow_to', '% of goal value', 'goal_value_post_tax', 'inflow_amount',
-        'total_outflow_amount', 'tax_out_of_outflow'
-    ]
-    return df[output_columns]
 
 
 def calculate_investment_cashflows(config, retirement_date, simulation_end_date=None):
@@ -660,242 +485,12 @@ def calculate_investment_cashflows(config, retirement_date, simulation_end_date=
     return df
 
 
-def get_withdrawl_df(goal_dfs):
-    """Return a ``[Date, Amount, Description]`` frame of Core-Corpus chain departures.
-
-    Crash-class fix (D-P202-5): when there are no Core-Corpus withdrawals (no goals,
-    0-occurrence goals, etc.) this returns a **typed** empty frame with the three
-    expected columns rather than a column-less ``pd.DataFrame([])``. The original v3
-    code returned a column-less frame, which made the downstream
-    ``add_withdrawls_to_trans`` ``sort_values('Date')`` raise ``KeyError: 'Date'``.
-    """
-    results = []
-    for name, df in goal_dfs.items():
-        # Filter for 'core corpus' withdrawals
-        for _, row in df[df['inflow_from'] == 'core corpus'].copy(deep=True).sort_values(by='inflow_date').iterrows():
-            results.append({
-                'Date': row['inflow_date'],
-                'Amount': row['inflow_amount'],
-                'Description': f'Moving to {row["place"]} for {name} goal.'
-            })
-    if not results:
-        return pd.DataFrame({
-            'Date': pd.Series(dtype=_NS_DTYPE),
-            'Amount': pd.Series(dtype=float),
-            'Description': pd.Series(dtype=object),
-        })
-    return pd.DataFrame(results)
 
 
-def create_core_corpus_trans(nav_df, investment_df, config):
-    """Open the Core Corpus with current_corpus, then layer in monthly Investment inflows."""
-    trans = []
-    current_corpus = float(config['current_corpus'])
-    current_date = pd.Timestamp(config['current_date'])
-
-    nav_rows = nav_df[nav_df['Date'] == current_date]
-    if nav_rows.empty:
-        nav_rows = nav_df[nav_df['Date'] <= current_date]
-    nav = nav_rows['nav'].iloc[-1] if not nav_rows.empty else nav_df['nav'].iloc[0]
-    trans.append({
-        'Date': current_date, 'Amount': current_corpus, 'NAV': nav,
-        'units': current_corpus / nav, 'Description': 'Current Corpus'
-    })
-
-    for _, row in investment_df.iterrows():
-        amount = float(row['Investment'])
-        if amount <= 0:
-            continue
-        date = row['Date']
-        matches = nav_df[nav_df['Date'] <= date]
-        nav = matches['nav'].iloc[-1] if not matches.empty else nav_df['nav'].iloc[0]
-        trans.append({
-            'Date': date, 'Amount': amount, 'NAV': nav,
-            'units': amount / nav, 'Description': 'Investment'
-        })
-
-    return pd.DataFrame(trans)
 
 
-def add_withdrawls_to_trans(sip_trans_df, withdrawls_df, nav_df, instrument_params):
-    updated_trans_df = sip_trans_df.copy(deep=True)
-    # Ensure numeric columns are float to avoid dtype upcast errors on partial updates
-    for col in ['Amount', 'units', 'NAV']:
-        if col in updated_trans_df.columns:
-            updated_trans_df[col] = updated_trans_df[col].astype(float)
-    withdrawal_transactions = []
-
-    # Combine withdrawals from goals and post-retirement expenses
-    # Assume withdrawls_df has both
-
-    # Crash-class fix (D-P202-5): an empty / no-Date withdrawals frame means there are
-    # no Core-Corpus departures to settle. Skip the loop entirely and return the
-    # SIP-trans frame with the tax/fully_funded/shortfall columns + success=True,
-    # instead of letting ``sort_values('Date')`` raise ``KeyError: 'Date'``.
-    if withdrawls_df is None or 'Date' not in withdrawls_df.columns or withdrawls_df.empty:
-        sip_trans_final = sip_trans_df.copy()
-        sip_trans_final['tax'] = 0
-        sip_trans_final['fully_funded'] = True
-        sip_trans_final['shortfall'] = 0
-        sip_trans_final = sip_trans_final.sort_values('Date').reset_index(drop=True)
-        return sip_trans_final, True, None
-
-    # Sort withdrawals by date
-    withdrawls_df = withdrawls_df.sort_values('Date').reset_index(drop=True)
-
-    for _, row in withdrawls_df.iterrows():
-        amount = row['Amount']
-        date = row['Date']
-        description = row['Description']
-
-        # Get NAV
-        matches = nav_df[nav_df['Date'] <= date]
-        if not matches.empty:
-            current_nav = matches['nav'].iloc[-1]
-        else:
-            current_nav = nav_df['nav'].iloc[0]  # Should not happen if nav covers range
-
-        # Get available units up to this date
-        available_trans_df = updated_trans_df[updated_trans_df['Date'] <= date].copy()
-
-        if available_trans_df.empty:
-            withdrawal_transactions.append({
-                'Date': date, 'Amount': -amount, 'NAV': current_nav, 'units': -amount / current_nav,
-                'Description': description, 'tax': 0, 'fully_funded': False, 'shortfall': amount
-            })
-            continue
-
-        # Calculate Taxes and Liquidation
-        cc_stcg = instrument_params['core_corpus']['stcg_tax']
-        cc_ltcg = instrument_params['core_corpus']['ltcg_tax']
-        available_trans_df['current_value'] = available_trans_df['units'] * current_nav
-        available_trans_df['gains'] = available_trans_df['current_value'] - available_trans_df['Amount']
-        available_trans_df['holding_days'] = (date - available_trans_df['Date']).dt.days
-        available_trans_df['applicable_tax_rate'] = available_trans_df['holding_days'].apply(
-            lambda d: cc_stcg if d <= 365 else cc_ltcg
-        )
-        available_trans_df['tax'] = available_trans_df['gains'] * available_trans_df['applicable_tax_rate']
-        available_trans_df['post_tax_current_value'] = available_trans_df['current_value'] - available_trans_df['tax']
-
-        remaining_amount = amount
-        trans_ids_to_remove = []
-        trans_ids_to_update = {}
-        total_units_withdrawn = 0
-        total_pretax_amount = 0
-        total_tax_paid = 0
-
-        for id_, row_ in available_trans_df.iterrows():
-            if remaining_amount <= 0:
-                break
-
-            available_val = row_['post_tax_current_value']
-
-            if remaining_amount >= available_val:
-                remaining_amount -= available_val
-                trans_ids_to_remove.append(id_)
-                total_units_withdrawn += row_['units']
-                total_pretax_amount += row_['current_value']
-                total_tax_paid += row_['tax']
-            else:
-                fraction = remaining_amount / available_val
-                units_wd = row_['units'] * fraction
-                pretax_wd = row_['current_value'] * fraction
-                tax_wd = row_['tax'] * fraction
-
-                total_units_withdrawn += units_wd
-                total_pretax_amount += pretax_wd
-                total_tax_paid += tax_wd
-
-                trans_ids_to_update[id_] = {
-                    'units': row_['units'] - units_wd,
-                    'Amount': row_['Amount'] * (1 - fraction)
-                }
-                remaining_amount = 0
-
-        fully_funded = (remaining_amount <= 1e-6)
-
-        # Apply updates
-        updated_trans_df = updated_trans_df.drop(trans_ids_to_remove)
-        for id_, updates in trans_ids_to_update.items():
-            updated_trans_df.loc[id_, 'units'] = updates['units']
-            updated_trans_df.loc[id_, 'Amount'] = updates['Amount']
-
-        updated_trans_df = updated_trans_df.reset_index(drop=True)
-
-        if fully_funded:
-            withdrawal_transactions.append({
-                'Date': date, 'Amount': -total_pretax_amount, 'NAV': current_nav,
-                'units': -total_units_withdrawn, 'Description': description,
-                'tax': total_tax_paid, 'fully_funded': True, 'shortfall': 0
-            })
-        else:
-            withdrawal_transactions.append({
-                'Date': date, 'Amount': -amount, 'NAV': current_nav,
-                'units': -amount / current_nav, 'Description': description,
-                'tax': 0, 'fully_funded': False, 'shortfall': remaining_amount
-            })
-
-    # Combine
-    sip_trans_final = sip_trans_df.copy()
-    sip_trans_final['tax'] = 0
-    sip_trans_final['fully_funded'] = True
-    sip_trans_final['shortfall'] = 0
-
-    trans_df = pd.concat([sip_trans_final, pd.DataFrame(withdrawal_transactions)], ignore_index=True)
-    trans_df = trans_df.sort_values('Date').reset_index(drop=True)
-
-    failed = trans_df[trans_df['fully_funded'] == False]  # noqa: E712 (pandas mask)
-    success = len(failed) == 0
-
-    failure_details = None
-    if not success:
-        first_fail = failed.iloc[0]
-        failure_details = {
-            'date': first_fail['Date'],
-            'amount': abs(first_fail['shortfall']),  # Shortfall amount
-            'description': first_fail['Description']
-        }
-
-    return trans_df, success, failure_details
 
 
-def calculate_daily_value(final_trans_df, nav_df):
-    trans_df = final_trans_df.copy(deep=True)
-    trans_df['Date'] = trans_df['Date'].astype(_NS_DTYPE)
-    trans_df = trans_df.sort_values('Date').reset_index(drop=True)
-
-    trans_df = trans_df.groupby('Date', as_index=False)['units'].sum()
-
-    trans_df['cumulative_units'] = trans_df['units'].cumsum()
-    units_df = trans_df[['Date', 'cumulative_units']]
-
-    units_df['Date'] = units_df['Date'].astype(_NS_DTYPE)
-    units_df = units_df.sort_values('Date')
-
-    if units_df.empty:
-        return pd.DataFrame(columns=['Date', 'cumulative_units', 'nav', 'current_value'])
-
-    full_dates = pd.date_range(
-        start=units_df['Date'].min(),
-        end=units_df['Date'].max(),
-        freq='D'
-    )
-
-    units_df = (
-        units_df
-        .set_index('Date')
-        .reindex(full_dates)
-    )
-
-    units_df['cumulative_units'] = units_df['cumulative_units'].ffill()
-    units_df = units_df.reset_index().rename(columns={'index': 'Date'})
-
-    units_df = units_df.merge(nav_df, on='Date', how='left')
-
-    units_df['nav'] = units_df['nav'].ffill()
-    units_df['current_value'] = units_df['cumulative_units'] * units_df['nav']
-
-    return units_df
 
 
 # --- Main Simulation Logic ---
@@ -920,21 +515,375 @@ def _resolve_goals(goals, retirement_date, death_date=None):
     return resolved
 
 
-def run_simulation(config, retirement_date, instrument_params, glide_paths=None):
-    """Run a single simulation for the given retirement_date and return its outcome.
+# ============================================================================
+# v2 GRID PROVISIONING + SETTLEMENT (DECISIONS.md 2026-08-24)
+#
+# The glide-path chains and the shared Debt/Hybrid pools are both RETIRED.
+# Every goal - however long it runs - expands into cashflows, and each
+# cashflow is provisioned by the goal grid (grid_engine.py / goal_grid.py).
+# "Replenishing" is DERIVED (cashflows beyond the grid's reach), never typed;
+# the goal `nature` input is accepted and ignored for compatibility.
+#
+# Failure semantics (operator decision #3, 2026-08-24): a month where Core
+# cannot fund a provisioning event is NOT a failure - the slice retries every
+# later month. Failure means a DUE cashflow is still short after draining its
+# own sleeves, Core, and every other goal's sleeves: all pools depleted.
+# ============================================================================
 
-    Month-grid invariant (D-P223-2): input dates are normalised to day=1 here as
-    a defensive guard for callers that bypass ``find_retirement_date`` (e.g. the
-    service's infeasible-diagnostics path, direct test calls). The solver already
-    goes through ``find_retirement_date`` which normalises first; this second call
-    is idempotent.
 
-    Returns ``(success, final_trans_df, failure_details, pool_movements_df, goal_dfs, comprehensive_df)``.
+def _nav_value(rate, t0, date):
+    """The engine's pseudo-NAV closed form (daily compounding from t0)."""
+    days = (pd.Timestamp(date) - pd.Timestamp(t0)).days
+    return 100.0 * (1.0 + rate) ** (days / 365.0)
+
+
+def _build_goal_specs(goals, current_date):
+    """Tranches + priority + display labels for every goal (no nature split).
+
+    Display-name dedupe (+goaldedupe) now applies to ALL goals: the first goal
+    of a name keeps it, later ones become "<name> #2", "<name> #3", ...
+    Priority is the Goal Algo step-4 order: negotiability rank, earliest
+    cashflow, larger total first - funding is sequential in this order.
     """
-    if glide_paths is None:
-        glide_paths = get_glide_paths()
+    specs = []
+    name_counts = {}
+    for goal in goals:
+        base = goal['name']
+        seen = name_counts.get(base, 0)
+        name_counts[base] = seen + 1
+        label = base if seen == 0 else f"{base} #{seen + 1}"
+        neg = normalise_negotiability(goal.get('type'))
+        tranches = expand_recurring_goal_to_tranches(goal, current_date)
+        tranches = [(pd.Timestamp(d).replace(day=1), float(fv))
+                    for d, fv in tranches if float(fv) > 0]
+        if not tranches:
+            continue
+        first = min(d for d, _ in tranches)
+        total = sum(fv for _, fv in tranches)
+        specs.append({'label': label, 'neg': neg, 'tranches': tranches,
+                      'sort': (_NEG_RANK[neg], first, -total)})
+    specs.sort(key=lambda s: s['sort'])
+    for pri, s in enumerate(specs):
+        s['priority'] = pri
+    return specs
 
-    # D-P223-2: defensive day=1 normalisation for direct callers.
+
+class _GridSlice:
+    """One slice of one cashflow's funding: a route, a target, and a pool."""
+    __slots__ = ('goal', 'share', 'target_net', 'unfunded', 'hops', 'entry',
+                 'conv_month', 'place', 'pool', 'priority', 'cf_date')
+
+    def __init__(self, goal, priority, cf_date, share, target_net, hops,
+                 instrument_params):
+        self.goal = goal
+        self.priority = priority
+        self.cf_date = cf_date
+        self.share = share
+        self.target_net = target_net
+        self.unfunded = target_net
+        self.hops = hops
+        self.entry = pd.Timestamp(hops[0][1])
+        self.conv_month = pd.Timestamp(hops[1][1]) if len(hops) > 1 else None
+        self.place = hops[0][0]
+        params = instrument_params[self.place]
+        self.pool = InvestmentPool(self.place.capitalize(),
+                                   params['stcg_tax'], params['ltcg_tax'])
+
+
+def _settle_grid_plan(month0, final_month, core_inflows, tranche_list,
+                      instrument_params, nav_rates):
+    """Monthly settlement of the grid plan against live FIFO pools.
+
+    ``core_inflows``: {month: [(amount, description), ...]} - corpus seed,
+    surplus income, one-time investments. ``tranche_list``: dicts with
+    'goal', 'priority', 'cf_date', 'fv_net', 'slices' ([_GridSlice]).
+
+    Returns (success, failure_details, final_trans_df, pool_trans_df,
+    pool_movements_df, monthly_units) where monthly_units is
+    [(month, core_units, {'debt': u, 'hybrid': u}, {goal: {'debt': u, ...}})].
+    The simulation records the FIRST failure and keeps going, so diagnostics
+    (workbook, CSV, comprehensive view) exist even for infeasible plans.
+    """
+    month0 = pd.Timestamp(month0)
+    final_month = pd.Timestamp(final_month)
+
+    cc = instrument_params['core_corpus']
+    core = InvestmentPool('Core Corpus', cc['stcg_tax'], cc['ltcg_tax'])
+
+    months = list(pd.date_range(month0, final_month, freq='MS'))
+    navs = {place: {m: _nav_value(nav_rates[place], month0, m) for m in months}
+            for place in ('core', 'debt', 'hybrid')}
+
+    final_trans, pool_trans, movements, monthly_units = [], [], [], []
+    core_units = 0.0
+    bucket_units = {'debt': 0.0, 'hybrid': 0.0}
+    goal_units = {}
+
+    def core_row(row):
+        nonlocal core_units
+        if row is None:
+            return
+        core_units += row['units']
+        final_trans.append(row)
+
+    def pool_row(row, sl, flows):
+        if row is None:
+            return
+        bucket = sl.place
+        bucket_units[bucket] += row['units']
+        gu = goal_units.setdefault(sl.goal, {'debt': 0.0, 'hybrid': 0.0})
+        gu[bucket] += row['units']
+        row = dict(row)
+        row['Pool'] = bucket.capitalize()
+        pool_trans.append(row)
+        key = f"{bucket}_{'in' if row['Amount'] >= 0 else 'out'}"
+        flows[key] += abs(row['Amount'])
+
+    entries, conversions, payments = {}, {}, {}
+    all_slices = []
+    for tr in tranche_list:
+        payments.setdefault(pd.Timestamp(tr['cf_date']), []).append(tr)
+        for sl in tr['slices']:
+            entries.setdefault(sl.entry, []).append(sl)
+            if sl.conv_month is not None:
+                conversions.setdefault(sl.conv_month, []).append(sl)
+            all_slices.append(sl)
+
+    pending = set()
+    paid = set()          # slices whose cashflow has been settled
+    success, failure = True, None
+
+    for m in months:
+        flows = {'debt_in': 0.0, 'debt_out': 0.0,
+                 'hybrid_in': 0.0, 'hybrid_out': 0.0}
+        core_nav = navs['core'][m]
+
+        # 1. Core inflows (corpus seed, surplus income, one-time investments).
+        for amount, desc in core_inflows.get(m, []):
+            core_row(core.invest(m, amount, core_nav, description=desc))
+
+        # 2. Conversions: hybrid -> debt at the final-row boundary. Convert
+        #    whatever the slice actually holds; taxes on the realized gain.
+        for sl in conversions.get(m, []):
+            if id(sl) in paid:
+                continue
+            h_nav = navs['hybrid'][m]
+            value = sl.pool.get_market_value(h_nav)
+            if value > 0.01:
+                wd = sl.pool.redeem_gross_amount(
+                    m, value, h_nav, description=f"Convert to Debt: {sl.goal}")
+                pool_row(wd, sl, flows)
+                net = wd['net_received']
+            else:
+                net = 0.0
+            params = instrument_params['debt']
+            sl.place = 'debt'
+            sl.pool = InvestmentPool('Debt', params['stcg_tax'], params['ltcg_tax'])
+            if net > 0.01:
+                pool_row(sl.pool.invest(m, net, navs['debt'][m],
+                                        description=f"Converted from Hybrid: {sl.goal}"),
+                         sl, flows)
+
+        # 3. Provisioning entries + retries, in priority order. A short month
+        #    is NOT a failure - the slice stays pending and re-sizes later.
+        for sl in entries.get(m, []):
+            if id(sl) not in paid:
+                pending.add(sl)
+        for sl in sorted(pending, key=lambda s: (s.priority, s.cf_date)):
+            if sl.unfunded <= 0.01:
+                pending.discard(sl)
+                continue
+            principal = slice_principal(sl.unfunded, sl.hops, m, navs,
+                                        instrument_params, _STCG_MAX_YEARS)
+            if principal <= 0.01:
+                pending.discard(sl)
+                continue
+            wd = core.redeem_net_amount(
+                m, principal, core_nav,
+                description=f"Moving to {sl.place} for {sl.goal} goal.")
+            got = wd['net_received']
+            if abs(wd['Amount']) > 1e-9:
+                core_row(wd)
+            if got > 0.01:
+                pool_row(sl.pool.invest(m, got, navs[sl.place][m],
+                                        description=f"Provision: {sl.goal}"),
+                         sl, flows)
+                sl.unfunded = max(0.0, sl.unfunded * (1.0 - got / principal))
+            if sl.unfunded <= 0.01:
+                pending.discard(sl)
+
+        # 4. Payments due this month, in priority order. Waterfall: own debt
+        #    sleeves, own hybrid sleeves, Core, then EVERY other sleeve in
+        #    reverse priority. Only exhausting all of that is failure.
+        for tr in sorted(payments.get(m, []), key=lambda t: t['priority']):
+            remaining = tr['fv_net']
+            own = sorted(tr['slices'], key=lambda s: 0 if s.place == 'debt' else 1)
+            for sl in own:
+                if remaining <= _PAY_TOLERANCE:
+                    break
+                if sl.pool.get_market_value(navs[sl.place][m]) <= 0.01:
+                    continue
+                wd = sl.pool.redeem_net_amount(
+                    m, remaining, navs[sl.place][m],
+                    description=f"Goal Payout: {tr['goal']}")
+                pool_row(wd, sl, flows)
+                remaining = wd['shortfall']
+            if remaining > _PAY_TOLERANCE:
+                wd = core.redeem_net_amount(
+                    m, remaining, core_nav,
+                    description=f"Goal Payout (Core): {tr['goal']}")
+                if abs(wd['Amount']) > 1e-9:
+                    core_row(wd)
+                remaining = wd['shortfall']
+            if remaining > _PAY_TOLERANCE:
+                raiders = sorted(
+                    (s for s in all_slices
+                     if id(s) not in paid and s not in tr['slices']),
+                    key=lambda s: (-s.priority, s.cf_date))
+                for s2 in raiders:
+                    if remaining <= _PAY_TOLERANCE:
+                        break
+                    if s2.pool.get_market_value(navs[s2.place][m]) <= 0.01:
+                        continue
+                    wd = s2.pool.redeem_net_amount(
+                        m, remaining, navs[s2.place][m],
+                        description=f"Raided for {tr['goal']}")
+                    pool_row(wd, s2, flows)
+                    remaining = wd['shortfall']
+            if remaining > _PAY_TOLERANCE and failure is None:
+                success = False
+                failure = {
+                    'date': m, 'amount': remaining,
+                    'description': (f"All pools depleted — {tr['goal']} payout "
+                                    f"short by {format_inr(remaining)}"),
+                }
+            # Sweep any leftover back to Core. Sizing targets the cashflow
+            # exactly, so this is normally rounding dust - but a slice that
+            # over-delivered (e.g. funded late, then NAVs moved) would
+            # otherwise be stranded in a sleeve nobody reads again.
+            for sl in tr['slices']:
+                leftover = sl.pool.get_market_value(navs[sl.place][m])
+                if leftover > 1.0:
+                    wd = sl.pool.redeem_gross_amount(
+                        m, leftover, navs[sl.place][m],
+                        description=f"Sweep to Core: {tr['goal']}")
+                    pool_row(wd, sl, flows)
+                    core_row(core.invest(m, wd['net_received'], core_nav,
+                                         description=f"Swept from {sl.place}: {tr['goal']}"))
+                paid.add(id(sl))
+                pending.discard(sl)
+
+        # 5. Month snapshot for movements + comprehensive view.
+        movements.append({
+            'Date': m,
+            'Debt Pool Value': bucket_units['debt'] * navs['debt'][m],
+            'Inflow to Debt': flows['debt_in'],
+            'Outflow from Debt': flows['debt_out'],
+            'Hybrid Pool Value': bucket_units['hybrid'] * navs['hybrid'][m],
+            'Inflow to Hybrid': flows['hybrid_in'],
+            'Outflow from Hybrid': flows['hybrid_out'],
+        })
+        monthly_units.append((m, core_units, dict(bucket_units),
+                              {g: dict(u) for g, u in goal_units.items()}))
+
+    final_trans_df = pd.DataFrame(final_trans)
+    if not final_trans_df.empty:
+        final_trans_df = final_trans_df.sort_values('Date').reset_index(drop=True)
+    pool_trans_df = pd.DataFrame(pool_trans)
+    pool_movements_df = pd.DataFrame(movements)
+    return (success, failure, final_trans_df, pool_trans_df,
+            pool_movements_df, monthly_units)
+
+
+def generate_comprehensive_view(config, monthly_units, nav_rates, month0,
+                                investment_df, payouts_df,
+                                surplus_investment_df, net_payouts_df,
+                                death_date):
+    """Month-end view of every balance the plan holds (v2: from settlement).
+
+    v1 rebuilt these values from transaction frames and planned chain
+    schedules; v2's settlement already tracks exact unit balances per month,
+    per bucket, per goal - this just prices them at month-end NAVs and merges
+    the monthly cashflow attributions (same column names as v1, so the UI,
+    CSV, and advisor workbook read it unchanged).
+    """
+    month0 = pd.Timestamp(month0)
+    if not monthly_units:
+        return pd.DataFrame()
+    last_month = monthly_units[-1][0]
+    end_date = max(last_month, pd.Timestamp(death_date))
+    master_df = _ensure_date_ns(pd.DataFrame(
+        {'Date': pd.date_range(start=month0, end=end_date, freq='ME')}))
+
+    by_period = {m.to_period('M'): (cu, bu, gu)
+                 for m, cu, bu, gu in monthly_units}
+    goal_names = sorted({g for _m, _cu, _bu, gu in monthly_units for g in gu})
+
+    rows_core, rows_debt, rows_hybrid = [], [], []
+    rows_goal = {g: {'debt': [], 'hybrid': []} for g in goal_names}
+    last = None
+    for d in master_df['Date']:
+        snap = by_period.get(d.to_period('M'), last)
+        last = snap if snap is not None else last
+        if snap is None:
+            cu, bu, gu = 0.0, {'debt': 0.0, 'hybrid': 0.0}, {}
+        else:
+            cu, bu, gu = snap
+        rows_core.append(cu * _nav_value(nav_rates['core'], month0, d))
+        rows_debt.append(bu['debt'] * _nav_value(nav_rates['debt'], month0, d))
+        rows_hybrid.append(bu['hybrid'] * _nav_value(nav_rates['hybrid'], month0, d))
+        for g in goal_names:
+            u = gu.get(g, {'debt': 0.0, 'hybrid': 0.0})
+            rows_goal[g]['debt'].append(
+                u['debt'] * _nav_value(nav_rates['debt'], month0, d))
+            rows_goal[g]['hybrid'].append(
+                u['hybrid'] * _nav_value(nav_rates['hybrid'], month0, d))
+
+    master_df['Core Corpus Value'] = rows_core
+    master_df['Debt Pool Value'] = rows_debt
+    master_df['Hybrid Pool Value'] = rows_hybrid
+    for g in goal_names:
+        master_df[f'{g} Debt Value'] = rows_goal[g]['debt']
+        master_df[f'{g} Hybrid Value'] = rows_goal[g]['hybrid']
+
+    # Monthly cashflow attributions - identical column names to v1.
+    master_df['YearMonth'] = master_df['Date'].dt.to_period('M')
+
+    def _merge_monthly(df, value_col, out_col):
+        nonlocal master_df
+        if df is not None and not df.empty:
+            tmp = df.copy()
+            tmp['YearMonth'] = tmp['Date'].dt.to_period('M')
+            agg = (tmp.groupby('YearMonth')[value_col].sum().reset_index()
+                   .rename(columns={value_col: out_col}))
+            master_df = master_df.merge(agg, on='YearMonth', how='left')
+            master_df[out_col] = master_df[out_col].fillna(0)
+        else:
+            master_df[out_col] = 0.0
+
+    _merge_monthly(investment_df, 'Investment', 'Investment')
+    _merge_monthly(payouts_df, 'Amount', 'Replenishing Payouts')
+    if surplus_investment_df is not None and not surplus_investment_df.empty:
+        _merge_monthly(surplus_investment_df, 'Investment', 'Investment to Corpus')
+    else:
+        master_df['Investment to Corpus'] = master_df['Investment']
+    master_df['Investment Used for Payouts'] = (
+        master_df['Investment'] - master_df['Investment to Corpus']).clip(lower=0)
+    _merge_monthly(net_payouts_df, 'Amount', 'Net Payouts (Pool)')
+
+    return master_df.drop(columns=['YearMonth'])
+
+
+def run_simulation(config, retirement_date, instrument_params, glide_paths=None):
+    """Run one simulation for the given retirement_date and return its outcome.
+
+    v2 (DECISIONS.md 2026-08-24): goal provisioning is the GRID - no chains,
+    no shared pools, no typed nature. ``glide_paths`` is accepted and ignored
+    for caller compatibility. Month-grid invariant (D-P223-2) unchanged.
+
+    Returns ``(success, final_trans_df, failure_details, pool_movements_df,
+    goal_dfs, comprehensive_df)`` - the same contract as v1.
+    """
     config = _normalise_config_dates(config)
 
     current_date = pd.Timestamp(config['current_date'])
@@ -943,465 +892,127 @@ def run_simulation(config, retirement_date, instrument_params, glide_paths=None)
     current_age = config.get('current_age', 30)
     death_date = pd.Timestamp(current_date + pd.DateOffset(years=int(target_lifetime - current_age)))
 
-    # 0. Resolve goals: linked start_dates and Recurring end_mode -> concrete occurrences.
+    # 0. Resolve goals (start-at-retirement links, Recurring end modes).
     goals = _resolve_goals(config.get('goals', []), retirement_date, death_date)
 
-    # 1. Non-replenishing goals -> chain math, one tranche per occurrence.
-    goal_dfs = {}
-    last_goal_date = current_date
-    # Goal names are user-supplied and need NOT be unique -- two children's
-    # "Child Education" goals are the norm, and the app's goal templates all
-    # insert the same default name. goal_dfs is keyed by that name, so before
-    # "+goaldedupe" (2026-08-20) a second goal with the same name -- and, for
-    # Recurring goals, the same occurrence count -- produced identical keys and
-    # SILENTLY OVERWROTE the first. The first goal was then never provisioned,
-    # never withdrawn for, and absent from every output, while the plan still
-    # reported success at an impossibly early retirement date. Disambiguate per
-    # goal below; the FIRST goal of a given name keeps that name exactly, so
-    # output for plans without duplicates is byte-identical to before.
-    _goal_name_counts = {}
-    for goal in goals:
-        if str(goal.get('nature', '')).lower() == 'replenishing':
-            continue
-        _base_name = goal['name']
-        _seen = _goal_name_counts.get(_base_name, 0)
-        _goal_name_counts[_base_name] = _seen + 1
-        _disp_name = _base_name if _seen == 0 else f"{_base_name} #{_seen + 1}"
-        tranches = expand_recurring_goal_to_tranches(goal, current_date)
-        for i, (tranche_date, tranche_fv) in enumerate(tranches):
-            if tranche_date > last_goal_date:
-                last_goal_date = tranche_date
-            label = _disp_name if len(tranches) == 1 else f"{_disp_name} ({i+1}/{len(tranches)})"
-            goal_dfs[label] = calculate_goal_cashflows(
-                input_df=glide_paths[goal['type']],
-                end_date=tranche_date,
-                goal_value_post_tax=tranche_fv,
-                instrument_params=instrument_params,
-                input_variables=config,
-            )
+    # 1. Goal specs: tranches, negotiability, priority, display labels.
+    specs = _build_goal_specs(goals, current_date)
 
-    final_date = min(max(last_goal_date, death_date), _MAX_SAFE_DATE)
+    last_cf = max((d for s in specs for d, _fv in s['tranches']),
+                  default=current_date)
+    final_date = min(max(last_cf, death_date), _MAX_SAFE_DATE)
+    final_month = final_date.replace(day=1)
 
-    # 2. NAV series.
-    nav_df = generate_pseudo_nav(current_date, final_date, instrument_params['core_corpus']['return'])
-    debt_nav_df = generate_pseudo_nav(current_date, final_date, instrument_params['debt']['return'])
-    hybrid_nav_df = generate_pseudo_nav(current_date, final_date, instrument_params['hybrid']['return'])
-
-    # 3. Cashflow series — a single unified monthly Investment series and gross Replenishing payouts.
+    # 2. Income streams; gross payouts; income nets against payouts FIRST
+    #    (in priority order) - only the balance is provisioned, only surplus
+    #    income reaches the Core Corpus.
     investment_df = calculate_investment_cashflows(config, retirement_date, final_date)
-    payouts_df = compute_replenishing_payouts(goals, current_date)
 
-    # 3b. Net investment against payouts (aggregate, per calendar month). Investment funds payouts
-    #     first; only the *balance* needs the pool, and only *surplus* investment flows into the Core Corpus.
-    net_payouts_df, surplus_investment_df = net_investment_against_payouts(investment_df, payouts_df, current_date)
+    flat = [{'spec': s, 'date': d, 'fv': fv, 'priority': s['priority']}
+            for s in specs for d, fv in s['tranches']]
+    payouts_df = (_ensure_date_ns(pd.DataFrame(
+        [{'Date': t['date'], 'Amount': t['fv']} for t in flat]))
+        if flat else pd.DataFrame({'Date': pd.Series(dtype=_NS_DTYPE),
+                                   'Amount': pd.Series(dtype=float)}))
 
-    # 4. Pool simulation — driven by the NET payout balance (after investment). Runs only when
-    #    investment fails to fully cover the Replenishing payouts in some month; if investment covers
-    #    everything, there is no pool at all.
-    if net_payouts_df.empty:
-        pool_trans_df = pd.DataFrame()
-        core_replenishments_df = pd.DataFrame()
-        pool_movements_df = pd.DataFrame()
-    else:
-        # Pre-funding ramp ("+poolprefund", 2026-08-11). Previously:
-        #     pool_start = min(first_net_payout, retirement_date)
-        # which meant a plan whose payouts begin AT or BEFORE retirement (the
-        # common retirement-income case) provisioned the pools' whole 48-month
-        # horizon in the single month the payouts START — a cliff — while a plan
-        # whose payouts begin AFTER retirement pre-funded smoothly through the
-        # very same machinery. Starting up to POOL_PREFUND_MONTHS earlier lets
-        # the existing lookahead windows (Debt 0-24m, Hybrid 25-48m) build the
-        # pools gradually over the preceding annual cycles, mirroring how
-        # glide paths de-risk Non-replenishing goals. Never earlier than the
-        # plan start; the result is always <= the previous pool_start, so
-        # provisioning can only begin earlier, never later.
-        first_net_payout = pd.Timestamp(net_payouts_df['Date'].min())
-        pool_start = max(
-            current_date,
-            min(first_net_payout - pd.DateOffset(months=POOL_PREFUND_MONTHS),
-                retirement_date),
-        )
-        (pool_trans_df, core_replenishments_df,
-         failure_date, failure_reason, pool_movements_df) = simulate_pool(
-            net_payouts_df, debt_nav_df, hybrid_nav_df,
-            instrument_params['debt'], instrument_params['hybrid'], pool_start, final_date,
-        )
-        if failure_date:
-            return (False, pool_trans_df,
-                    {'date': failure_date, 'amount': 0, 'description': failure_reason},
-                    pool_movements_df, goal_dfs, pd.DataFrame())
+    net_amounts, surplus_investment_df = net_tranches_against_income(flat, investment_df)
+    net_rows = [{'Date': t['date'], 'Amount': net}
+                for t, net in zip(flat, net_amounts) if net > 1e-6]
+    net_payouts_df = (_ensure_date_ns(pd.DataFrame(net_rows)) if net_rows
+                      else pd.DataFrame({'Date': pd.Series(dtype=_NS_DTYPE),
+                                         'Amount': pd.Series(dtype=float)}))
 
-    # 5. Build Core Corpus transactions: current corpus + SURPLUS Investment (post-netting) + One-time Investments.
-    core_trans = create_core_corpus_trans(nav_df, surplus_investment_df, config)
+    nav_rates = {'core': instrument_params['core_corpus']['return'],
+                 'debt': instrument_params['debt']['return'],
+                 'hybrid': instrument_params['hybrid']['return']}
+    months = list(pd.date_range(current_date, final_month, freq='MS'))
+    navs = {place: {m: _nav_value(nav_rates[place], current_date, m)
+                    for m in months}
+            for place in ('core', 'debt', 'hybrid')}
 
-    # One-time investments — one-off inflows at face value on their date.
+    # 3. Grid slice plans per (net-funded) tranche + chain-shaped goal tables.
+    tranche_list = []
+    goal_rows = {s['label']: [] for s in specs}
+    for t, net in zip(flat, net_amounts):
+        if net <= 1e-6:
+            continue
+        s = t['spec']
+        plan = grid_slice_plan(s['neg'], t['date'], current_date)
+        slices = [_GridSlice(s['label'], s['priority'], t['date'],
+                             p['share'], p['share'] * net, p['hops'],
+                             instrument_params)
+                  for p in plan]
+        tranche_list.append({'goal': s['label'], 'priority': s['priority'],
+                             'cf_date': t['date'], 'fv_net': net,
+                             'slices': slices})
+        tid = f"t{len(tranche_list)}"
+
+        def _principals(sl):
+            amts = [slice_principal(sl['share'] * net, sl['hops'],
+                                    sl['hops'][0][1], navs, instrument_params,
+                                    _STCG_MAX_YEARS)]
+            for hi, (place, h_in, h_out) in enumerate(sl['hops'][:-1]):
+                nxt = slice_principal(sl['share'] * net, sl['hops'],
+                                      sl['hops'][hi + 1][1], navs,
+                                      instrument_params, _STCG_MAX_YEARS)
+                amts.append(nxt)
+            return amts
+
+        goal_rows[s['label']].extend(
+            chain_table_rows(tid, s['neg'], t['date'], net, plan,
+                             _principals, navs))
+
+    goal_dfs = {}
+    for s in specs:
+        rows = goal_rows[s['label']]
+        if rows:
+            df = pd.DataFrame(rows)
+            df['inflow_date'] = df['inflow_date'].astype(_NS_DTYPE)
+            df['outflow_date'] = pd.to_datetime(df['outflow_date']).astype(_NS_DTYPE)
+            goal_dfs[s['label']] = df
+
+    # 4. Core inflows: corpus seed, surplus income, one-time investments.
+    core_inflows = {}
+
+    def _add_inflow(date, amount, desc):
+        if amount <= 0:
+            return
+        core_inflows.setdefault(pd.Timestamp(date).replace(day=1), []).append(
+            (float(amount), desc))
+
+    _add_inflow(current_date, float(config['current_corpus']), 'Current Corpus')
+    if surplus_investment_df is not None and not surplus_investment_df.empty:
+        agg = (surplus_investment_df.assign(
+            _m=surplus_investment_df['Date'].dt.to_period('M'))
+            .groupby('_m')['Investment'].sum())
+        for period, amount in agg.items():
+            _add_inflow(period.to_timestamp(), amount, 'Investment')
     for w in config.get('one_time_investments', []) or []:
         wdate = pd.Timestamp(w['date'])
         wamount = float(w.get('amount', 0))
-        if wamount == 0 or wdate < current_date or wdate > final_date:
-            continue
-        matches = nav_df[nav_df['Date'] <= wdate]
-        wnav = matches['nav'].iloc[-1] if not matches.empty else nav_df['nav'].iloc[0]
-        core_trans = pd.concat([core_trans, pd.DataFrame([{
-            'Date': wdate, 'Amount': wamount, 'NAV': wnav,
-            'units': wamount / wnav, 'Description': f"One-time Investment: {w.get('name', '')}".strip(),
-        }])], ignore_index=True)
+        if wamount > 0 and current_date <= wdate <= final_date:
+            _add_inflow(wdate, wamount,
+                        f"One-time Investment: {w.get('name', '')}".strip())
 
-    core_trans = core_trans.sort_values('Date').reset_index(drop=True)
-
-    # 6. Core Corpus withdrawals: Non-replenishing chain departures + pool refills.
-    withdrawals_from_goals = get_withdrawl_df(goal_dfs)
-    if core_replenishments_df is None or core_replenishments_df.empty:
-        all_withdrawals = withdrawals_from_goals
-    else:
-        all_withdrawals = pd.concat([withdrawals_from_goals, core_replenishments_df], ignore_index=True)
-
-    final_trans_df, success, failure_details = add_withdrawls_to_trans(
-        core_trans, all_withdrawals, nav_df, instrument_params,
-    )
+    # 5. Monthly settlement.
+    (success, failure_details, final_trans_df, _pool_trans_df,
+     pool_movements_df, monthly_units) = _settle_grid_plan(
+        current_date, final_month, core_inflows, tranche_list,
+        instrument_params, nav_rates)
 
     comprehensive_df = generate_comprehensive_view(
-        config, final_trans_df, pool_trans_df, goal_dfs,
-        nav_df, debt_nav_df, hybrid_nav_df,
-        investment_df, payouts_df,
-        surplus_investment_df=surplus_investment_df, net_payouts_df=net_payouts_df,
-    )
+        config, monthly_units, nav_rates, current_date,
+        investment_df, payouts_df, surplus_investment_df, net_payouts_df,
+        death_date)
 
-    return success, final_trans_df, failure_details, pool_movements_df, goal_dfs, comprehensive_df
+    return (success, final_trans_df, failure_details, pool_movements_df,
+            goal_dfs, comprehensive_df)
 
 
-def generate_comprehensive_view(config, final_trans_df, pool_trans_df, goal_dfs, nav_df,
-                                debt_nav_df, hybrid_nav_df, investment_df, payouts_df,
-                                surplus_investment_df=None, net_payouts_df=None):
-    current_date = pd.Timestamp(config['current_date'])
-    target_lifetime = config.get('target_lifetime', 90)
-    current_age = config.get('current_age', 30)
-    death_date = pd.Timestamp(current_date + pd.DateOffset(years=int(target_lifetime - current_age)))
 
-    end_date = final_trans_df['Date'].max()
-    if pool_trans_df is not None and not pool_trans_df.empty:
-        end_date = max(end_date, pool_trans_df['Date'].max())
-    # Always extend at least to death_date so the chart reaches the full target lifetime
-    end_date = max(end_date, death_date)
 
-    # Generate Month-End dates up to end_date
-    full_date_range = pd.date_range(start=current_date, end=end_date, freq='ME')
 
-    # Create the master DF
-    master_df = _ensure_date_ns(pd.DataFrame({'Date': full_date_range}))
 
-    # 1. Core Corpus Value
-    core_trans = final_trans_df.copy()
-    core_trans['Date'] = core_trans['Date'].astype(_NS_DTYPE)
-    core_trans = core_trans.sort_values('Date')
-    core_daily_cats = _ensure_date_ns(pd.DataFrame({'Date': pd.date_range(start=current_date, end=end_date, freq='D')}))
-
-    # Agg transactions by day
-    agg_trans = core_trans.groupby('Date')['units'].sum().reset_index()
-    core_vals = core_daily_cats.merge(agg_trans, on='Date', how='left').fillna(0)
-    core_vals['cum_units'] = core_vals['units'].cumsum()
-
-    # Get NAVs
-    core_vals = core_vals.merge(nav_df[['Date', 'nav']], on='Date', how='left').ffill()
-    core_vals['Core Corpus Value'] = core_vals['cum_units'] * core_vals['nav']
-
-    # Merge into Master
-    master_df = pd.merge_asof(master_df, core_vals[['Date', 'Core Corpus Value']], on='Date')
-
-    # 2. Expense Debt & Hybrid Pools
-    if pool_trans_df is not None and not pool_trans_df.empty:
-        # Separate by Pool
-        pool_trans_df['Date'] = pool_trans_df['Date'].astype(_NS_DTYPE)
-
-        for pool_name, nav_source in [('Debt', debt_nav_df), ('Hybrid', hybrid_nav_df)]:
-            p_trans = pool_trans_df[pool_trans_df['Pool'] == pool_name].copy()
-            if p_trans.empty:
-                master_df[f'{pool_name} Pool Value'] = 0.0
-                continue
-
-            agg_p = p_trans.groupby('Date')['units'].sum().reset_index()
-            daily_p = _ensure_date_ns(pd.DataFrame({'Date': pd.date_range(start=current_date, end=end_date, freq='D')}))
-            daily_p = daily_p.merge(agg_p, on='Date', how='left').fillna(0)
-            daily_p['cum_units'] = daily_p['units'].cumsum()
-
-            daily_p = daily_p.merge(nav_source[['Date', 'nav']], on='Date', how='left').ffill()
-            daily_p['val'] = daily_p['cum_units'] * daily_p['nav']
-
-            master_df = pd.merge_asof(master_df, daily_p[['Date', 'val']], on='Date')
-            master_df = master_df.rename(columns={'val': f'{pool_name} Pool Value'})
-    else:
-        master_df['Debt Pool Value'] = 0.0
-        master_df['Hybrid Pool Value'] = 0.0
-
-    # 3. Goal Specific Pools
-    for goal_name, df in goal_dfs.items():
-        # Initialize columns
-        master_df[f'{goal_name} Debt Value'] = 0.0
-        master_df[f'{goal_name} Hybrid Value'] = 0.0
-
-        for idx, row in df.iterrows():
-            place = row['place'].lower()
-            if place not in ['debt', 'hybrid']:
-                continue
-
-            start_d = row['inflow_date']
-            end_d = row['outflow_date'] if pd.notna(row['outflow_date']) else end_date
-            amount = row['inflow_amount']
-
-            if start_d >= end_d:
-                continue
-
-            # Select NAV DF
-            curr_nav_df = debt_nav_df if place == 'debt' else hybrid_nav_df
-
-            # Get Start NAV
-            s_nav_rows = curr_nav_df[curr_nav_df['Date'] <= start_d]
-            if s_nav_rows.empty:
-                s_nav = curr_nav_df['nav'].iloc[0]
-            else:
-                s_nav = s_nav_rows['nav'].iloc[-1]
-
-            units = amount / s_nav
-
-            # Calculate value for the range
-            mask = (master_df['Date'] >= start_d) & (master_df['Date'] <= end_d)
-            subset_dates = master_df.loc[mask, 'Date']
-
-            # Get NAVs for these dates
-            temp_df = _ensure_date_ns(pd.DataFrame({'Date': subset_dates}))
-            temp_df = pd.merge_asof(temp_df, curr_nav_df, on='Date')
-
-            # Add to master
-            values = temp_df['nav'] * units
-
-            col_name = f'{goal_name} {place.capitalize()} Value'
-            master_df.loc[mask, col_name] += values.values
-
-    # 4. Monthly cashflow attributions (Investment, Replenishing Payouts).
-    master_df['YearMonth'] = master_df['Date'].dt.to_period('M')
-
-    if investment_df is not None and not investment_df.empty:
-        inc = investment_df.copy()
-        inc['YearMonth'] = inc['Date'].dt.to_period('M')
-        inc_agg = inc.groupby('YearMonth')['Investment'].sum().reset_index()
-        master_df = master_df.merge(inc_agg, on='YearMonth', how='left').fillna({'Investment': 0})
-    else:
-        master_df['Investment'] = 0.0
-
-    if payouts_df is not None and not payouts_df.empty:
-        pay = payouts_df.copy()
-        pay['YearMonth'] = pay['Date'].dt.to_period('M')
-        pay_agg = pay.groupby('YearMonth')['Amount'].sum().reset_index().rename(columns={'Amount': 'Replenishing Payouts'})
-        master_df = master_df.merge(pay_agg, on='YearMonth', how='left').fillna({'Replenishing Payouts': 0})
-    else:
-        master_df['Replenishing Payouts'] = 0.0
-
-    # Investment<->payout netting attributions: how the month's investment and payouts were split.
-    if surplus_investment_df is not None and not surplus_investment_df.empty:
-        si = surplus_investment_df.copy()
-        si['YearMonth'] = si['Date'].dt.to_period('M')
-        si_agg = si.groupby('YearMonth')['Investment'].sum().reset_index().rename(columns={'Investment': 'Investment to Corpus'})
-        master_df = master_df.merge(si_agg, on='YearMonth', how='left').fillna({'Investment to Corpus': 0})
-    else:
-        master_df['Investment to Corpus'] = master_df['Investment']
-    master_df['Investment Used for Payouts'] = (master_df['Investment'] - master_df['Investment to Corpus']).clip(lower=0)
-
-    if net_payouts_df is not None and not net_payouts_df.empty:
-        npay = net_payouts_df.copy()
-        npay['YearMonth'] = npay['Date'].dt.to_period('M')
-        npay_agg = npay.groupby('YearMonth')['Amount'].sum().reset_index().rename(columns={'Amount': 'Net Payouts (Pool)'})
-        master_df = master_df.merge(npay_agg, on='YearMonth', how='left').fillna({'Net Payouts (Pool)': 0})
-    else:
-        master_df['Net Payouts (Pool)'] = 0.0
-
-    master_df = master_df.drop(columns=['YearMonth'])
-
-    return master_df
-
-
-def calculate_debt_injection_need(expenses_list, injection_date, pool_params):
-    # expenses_list: list of (date, amount)
-    # Returns PV needed at injection_date to meet these expenses
-
-    total_pv = 0
-    rate = pool_params['return']
-    stcg_tax = pool_params['stcg_tax']
-    ltcg_tax = pool_params['ltcg_tax']
-
-    for date, amount in expenses_list:
-        # A payout dated before injection_date is one the caller has bucketed into
-        # the current provisioning month (the withdrawal loop pays the whole
-        # calendar month regardless of day). Provision it as due *now* (years=0)
-        # rather than skipping it -- skipping under-provisions ~1 payout every
-        # month that has a tranche earlier in the month than the pool's run date,
-        # which accumulates and surfaces as a spurious depletion at the final
-        # month. (Pairs with the month-aligned ``window_start`` filter in simulate_pool.)
-        years_to_expense = max(0.0, (date - injection_date).days / 365.25)
-
-        tax_rate = stcg_tax if years_to_expense <= _STCG_MAX_YEARS else ltcg_tax
-        needed = calculate_corpus_required_for_future_expense(amount, years_to_expense, rate, tax_rate)
-        total_pv += needed
-
-    return total_pv
-
-
-def simulate_pool(payouts_df, debt_nav_df, hybrid_nav_df,
-                  debt_params, hybrid_params, sim_start, final_date):
-    """Run the Debt+Hybrid pool simulation, driven by the NET Replenishing payout schedule.
-
-    ``payouts_df`` is the *balance* after monthly investment has funded payouts first (see
-    ``net_investment_against_payouts``) — investment covers payouts directly, and only the shortfall the
-    pool must fund reaches this point. The pool is refilled from the Core Corpus on that net
-    schedule.
-
-    Returns: ``(pool_trans_df, core_replenishments_df, failure_date, failure_reason,
-    pool_movements_df)``.
-    """
-    debt_pool = InvestmentPool('Debt', debt_params['stcg_tax'], debt_params['ltcg_tax'])
-    hybrid_pool = InvestmentPool('Hybrid', hybrid_params['stcg_tax'], hybrid_params['ltcg_tax'])
-
-    pool_transactions = []
-    core_replenishments = []
-    pool_movements = []
-
-    if payouts_df is None or payouts_df.empty:
-        return (pd.DataFrame(pool_transactions), pd.DataFrame(core_replenishments),
-                None, None, pd.DataFrame(pool_movements))
-
-    debt_nav_dict = dict(zip(debt_nav_df['Date'], debt_nav_df['nav']))
-    hybrid_nav_dict = dict(zip(hybrid_nav_df['Date'], hybrid_nav_df['nav']))
-
-    def get_nav(date, nav_dict, default_df):
-        if date in nav_dict:
-            return nav_dict[date]
-        matches = default_df[default_df['Date'] <= date]
-        if not matches.empty:
-            return matches['nav'].iloc[-1]
-        return default_df['nav'].iloc[-1]
-
-    def log_movement(date, debt_in=0, debt_out=0, hybrid_in=0, hybrid_out=0):
-        d_nav = get_nav(date, debt_nav_dict, debt_nav_df)
-        h_nav = get_nav(date, hybrid_nav_dict, hybrid_nav_df)
-        pool_movements.append({
-            'Date': date,
-            'Debt Pool Value': debt_pool.get_market_value(d_nav),
-            'Inflow to Debt': debt_in, 'Outflow from Debt': debt_out,
-            'Hybrid Pool Value': hybrid_pool.get_market_value(h_nav),
-            'Inflow to Hybrid': hybrid_in, 'Outflow from Hybrid': hybrid_out,
-        })
-
-    payout_data = list(zip(payouts_df['Date'], payouts_df['Amount']))
-    payout_last_date = payouts_df['Date'].max()
-
-    sim_date = pd.Timestamp(sim_start)
-    final_date = pd.Timestamp(final_date)
-    while sim_date <= final_date and sim_date <= payout_last_date:
-        debt_nav = get_nav(sim_date, debt_nav_dict, debt_nav_df)
-        hybrid_nav = get_nav(sim_date, hybrid_nav_dict, hybrid_nav_df)
-
-        # A. Determine needs over the Debt (24m) and Hybrid (25-48m) windows.
-        # Pool durations 2+2 (Debt = next 2 years; Hybrid = the following 2 years).
-        # This is a DELIBERATE post-port change from v3's 2+3 (months=60) per
-        # operator decision (2026-06-09); the engine no longer matches v3's pool
-        # window here -- the engine_version stamp reflects the divergence.
-        debt_deadline = sim_date + pd.DateOffset(months=24)
-        hybrid_end = sim_date + pd.DateOffset(months=48)
-
-        # Provision from the START of sim_date's month, not sim_date itself. The
-        # monthly withdrawal loop below buckets payouts by (year, month), so it
-        # withdraws *every* payout in sim_date's month -- including ones dated
-        # earlier in the month than sim_date's day (e.g. retirement-income
-        # tranches on the 1st when sim_date lands on the 15th). Using
-        # ``sim_date <= d`` would exclude those same-month-but-earlier payouts
-        # from provisioning while still withdrawing them, so the pool runs short
-        # -- the failure is largest for a payout that lands exactly on the
-        # death/final date (e.g. a Lifetime expense), which previously surfaced
-        # as a spurious "Debt Pool Depleted" at the final month. Aligning the
-        # window lower bound to the month start makes provisioning cover exactly
-        # what the withdrawal loop will take.
-        window_start = sim_date.replace(day=1)
-        debt_due = [(d, a) for d, a in payout_data if window_start <= d < debt_deadline]
-        hybrid_due = [(d, a) for d, a in payout_data if debt_deadline <= d < hybrid_end]
-
-        target_debt_val = calculate_debt_injection_need(debt_due, sim_date, debt_params)
-        target_hybrid_val = calculate_debt_injection_need(hybrid_due, sim_date, hybrid_params)
-
-        # B. Execute transfers.
-        current_hybrid_val = hybrid_pool.get_market_value(hybrid_nav)
-        hybrid_latent_tax = hybrid_pool.get_unrealized_tax(hybrid_nav, sim_date)
-        hybrid_surplus = max(0.0, current_hybrid_val - (target_hybrid_val + hybrid_latent_tax))
-
-        current_debt_val = debt_pool.get_market_value(debt_nav)
-        debt_latent_tax = debt_pool.get_unrealized_tax(debt_nav, sim_date)
-        debt_shortfall = max(0.0, (target_debt_val + debt_latent_tax) - current_debt_val)
-
-        if debt_shortfall > 0 and hybrid_surplus > 0:
-            transfer_gross = min(hybrid_surplus, debt_shortfall)
-            wd_res = hybrid_pool.redeem_gross_amount(sim_date, transfer_gross, hybrid_nav,
-                                                     description="Transfer to Debt (Surplus)")
-            pool_transactions.append(wd_res)
-            net_proceeds = wd_res['net_received']
-            inv_res = debt_pool.invest(sim_date, net_proceeds, debt_nav, description="Transfer from Hybrid")
-            if inv_res:
-                pool_transactions.append(inv_res)
-            log_movement(sim_date, debt_in=net_proceeds, hybrid_out=transfer_gross)
-
-            current_debt_val = debt_pool.get_market_value(debt_nav)
-            debt_latent_tax = debt_pool.get_unrealized_tax(debt_nav, sim_date)
-            debt_shortfall = max(0.0, (target_debt_val + debt_latent_tax) - current_debt_val)
-
-        if debt_shortfall > 0.01:
-            core_replenishments.append({'Date': sim_date, 'Amount': debt_shortfall,
-                                        'Description': 'Replenishment: Debt Pool'})
-            inv_res = debt_pool.invest(sim_date, debt_shortfall, debt_nav, description="Replenishment from Core")
-            if inv_res:
-                pool_transactions.append(inv_res)
-            log_movement(sim_date, debt_in=debt_shortfall)
-
-        current_hybrid_val = hybrid_pool.get_market_value(hybrid_nav)
-        hybrid_latent_tax = hybrid_pool.get_unrealized_tax(hybrid_nav, sim_date)
-        hybrid_shortfall = max(0.0, (target_hybrid_val + hybrid_latent_tax) - current_hybrid_val)
-        if hybrid_shortfall > 0.01:
-            core_replenishments.append({'Date': sim_date, 'Amount': hybrid_shortfall,
-                                        'Description': 'Replenishment: Hybrid Pool'})
-            inv_res = hybrid_pool.invest(sim_date, hybrid_shortfall, hybrid_nav,
-                                         description="Replenishment from Core")
-            if inv_res:
-                pool_transactions.append(inv_res)
-            log_movement(sim_date, hybrid_in=hybrid_shortfall)
-
-        # C. Monthly withdrawals for the next 12 months.
-        next_year = sim_date + pd.DateOffset(months=12)
-        m_date = sim_date
-        while m_date < next_year and m_date <= final_date:
-            month_payouts = [a for d, a in payout_data if d.year == m_date.year and d.month == m_date.month]
-            if not month_payouts:
-                # Even idle months get logged so the comprehensive view has continuous pool values.
-                log_movement(m_date)
-                m_date += relativedelta(months=1)
-                continue
-
-            net_withdrawal = sum(month_payouts)
-
-            if net_withdrawal > 0:
-                curr_nav = get_nav(m_date, debt_nav_dict, debt_nav_df)
-                wd_res = debt_pool.redeem_net_amount(m_date, net_withdrawal, curr_nav,
-                                                     description="Goal Payout")
-                pool_transactions.append(wd_res)
-                log_movement(m_date, debt_out=net_withdrawal)
-                if not wd_res['fully_funded']:
-                    return (pd.DataFrame(pool_transactions), pd.DataFrame(core_replenishments),
-                            m_date, "Debt Pool Depleted",
-                            pd.DataFrame(pool_movements))
-            else:
-                log_movement(m_date)
-
-            m_date += relativedelta(months=1)
-
-        sim_date = next_year
-
-    return (pd.DataFrame(pool_transactions), pd.DataFrame(core_replenishments),
-            None, None, pd.DataFrame(pool_movements))
 
 
 _DEFAULT_INSTRUMENT_PARAMS = {

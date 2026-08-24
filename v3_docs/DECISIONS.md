@@ -6,6 +6,73 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-24 - v2: the GOAL GRID replaces glide-path chains and shared pools
+
+**What changed:** the goal model itself, per Punit's "4. Goal Planning" (§4.1-4.5)
+and "Goal Algo" docs. Engine stamp is now `v2grid+goaltaxequity` - the v1
+lineage string is retired (git history holds it).
+
+- **One grid, read per cashflow.** A goal is a series of cashflows; each is
+  looked up by whole years-to-cashflow (`t = days / 365.25`, load-bearing) and
+  negotiability, giving a Debt/Hybrid share of that cashflow's future value.
+  Glide-path chain scripts (`calculate_goal_cashflows`) and the shared
+  Debt/Hybrid pools (`simulate_pool`, `calculate_debt_injection_need`,
+  `compute_replenishing_payouts`) are DELETED, along with `POOL_PREFUND_MONTHS`
+  (+poolprefund, 2026-08-11) which existed only to soften the pools' cliff.
+- **Per-column reach**: non-negotiable pre-funds 5 years out, semi-negotiable
+  4, negotiable 3. Beyond its reach a cashflow carves nothing - it is Core's
+  job until a later month brings it into range.
+- **Purpose is DERIVED, never typed.** "Does this goal have cashflows outside
+  the carve window?" -> `GOAL_REPLENISH` / `GOAL_NON_REPLENISH`. The `nature`
+  input is gone from the form; saved files that carry one still load and their
+  stored value is ignored. The 48-month non-replenishing span cap
+  (D-P208-1) is retired with the chains - it was a chain-count performance
+  guard, and long recurring goals are exactly what the window handles.
+- **Sizing is PATH-CONSISTENT, not doc-literal** (operator decision, this
+  date). The doc discounts each sleeve at its own growth for the whole
+  distance; but the grid MOVES money hybrid->debt as the goal nears, and that
+  switch is taxed. So each slice is back-solved leg by leg along the route it
+  actually travels, net of tax at every hop. On the worked example the
+  doc-literal formula understates by ~9.9% with tax. `goal_grid.invest_today`
+  keeps the doc-literal behaviour as the golden reference against Punit's
+  worked tables (36 tests); `grid_engine.slice_principal` is what the
+  simulator uses.
+- **Dynamics** (the four operator answers, this date): Core is re-read
+  **monthly**, not annually; tax applies to both sizing and movement; failure
+  means **all pools depleted**; "Goal Algo" §6 ignored.
+- **Failure semantics.** A month where Core cannot fund a provisioning event
+  is NOT a failure - the slice stays pending and re-sizes every later month.
+  A due cashflow drains, in order: its own debt sleeves, its own hybrid
+  sleeves, Core, then every other goal's sleeves in REVERSE priority (so a
+  negotiable goal's money is taken before a non-negotiable goal goes short).
+  Only after all of that is the plan infeasible.
+- **Sequential funding order** (Goal Algo step 4): negotiability, then
+  earliest cashflow, then larger first. Income nets against due cashflows in
+  that same order, untaxed, before anything is provisioned.
+
+**Output contract unchanged.** `run_simulation` still returns
+`(success, final_trans_df, failure_details, pool_movements_df, goal_dfs,
+comprehensive_df)`; `goal_dfs` still uses the chain-table column shape (every
+slice IS a chain: Core -> bucket [-> bucket] -> goal), and the comprehensive
+view keeps its column names. So the advisor workbook, the CSV, the Excel
+summary, the CRM export, and the version log all read v2 unchanged.
+
+**Impact (replay of all 307 unique logged plans, v1 -> v2):** see the replay
+report of this date. Retirement dates move LATER by a few months on plans with
+long income streams - v2 keeps a rolling 5-year book per cashflow and taxes
+every hop it actually takes, where v1's pool sized a flat 48-month lookahead.
+That is the intended cost of the model being honest about where money sits.
+
+**Golden masters re-baselined** with full delta attribution (parity config 1
+2032-09 -> 2033-01, config 2 2028-02 -> 2028-05; transaction counts rise from
+tens to thousands because per-cashflow carves replace annual pool refills).
+
+**Revisit when:** Punit's grid percentages or per-column reach change (both are
+data - `goal_grid.GOAL_GRID` / `GOAL_REACH_YEARS`), or if the desk decides the
+doc-literal sizing should be restored (swap `slice_principal` for
+`goal_grid.invest_today_taxed`; Punit's worked tables would then reproduce
+exactly, at ~9.9% lighter funding).
+
 ## 2026-08-24 - Goal money uniformly EQUITY-taxed + LTCG year-boundary grace (`+goaltaxequity`)
 
 **What changed:** Two coupled taxation decisions from the advisory desk

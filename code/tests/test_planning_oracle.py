@@ -27,14 +27,16 @@ import pytest
 
 from app.planning.engine import (
     InvestmentPool,
+    _STCG_MAX_YEARS,
+    _nav_value,
     calculate_corpus_required_for_future_expense,
-    calculate_goal_cashflows,
     calculate_investment_cashflows,
     expand_recurring_goal_to_tranches,
     find_retirement_date,
     generate_pseudo_nav,
-    simulate_pool,
+    run_simulation,
 )
+from app.planning.grid_engine import grid_slice_plan, slice_principal
 
 TODAY = pd.Timestamp("2026-06-01")
 
@@ -104,15 +106,37 @@ class TestTaxLotOracle:
         assert res["tax"] == pytest.approx(500.0, abs=1e-6)
         assert res["net_received"] == pytest.approx(54_500.0, abs=1e-6)
 
-    def test_redeem_net_stcg_back_solve(self):
-        """Same lot redeemed on 2026-12-31 (364 days ≤ 365 → STCG 20%).
+    def test_redeem_net_at_the_year_boundary_is_ltcg(self):
+        """Same lot redeemed on 2026-12-31 — 364 days held.
 
-        Hand: tax/unit = 10×0.20 = 2 → net/unit = 108.
-        net 54,000 → units 500; gross 55,000; tax 1,000.
+        RE-COMPUTED for the +goaltaxequity boundary rule (2026-08-24): within
+        LTCG_GRACE_DAYS (2) of a full year counts as LONG-term, because the
+        desk shifts the redemption a day or two to complete the year. Before
+        that rule this was STCG at 20%.
+
+        Hand: tax/unit = 10×0.10 = 1 → net/unit = 109.
+        net 54,000 → units 54,000/109 = 495.412844...;
+        gross = 495.412844×110 = 54,495.41; tax = 495.41.
         """
         pool = InvestmentPool("Debt", stcg_tax=0.20, ltcg_tax=0.10)
         pool.invest(pd.Timestamp("2026-01-01"), 100_000, nav=100)
         res = pool.redeem_net_amount(pd.Timestamp("2026-12-31"), 54_000, nav=110)
+        assert -res["units"] == pytest.approx(54_000 / 109, abs=1e-9)
+        assert res["tax"] == pytest.approx(54_000 / 109, abs=1e-6)
+        assert res["net_received"] == pytest.approx(54_000.0, abs=1e-6)
+
+    def test_redeem_net_stcg_back_solve(self):
+        """A genuinely short holding — 363 days, one day inside the grace.
+
+        Hand: STCG 20% ⇒ tax/unit = 10×0.20 = 2 → net/unit = 108.
+        net 54,000 → units 500; gross 55,000; tax 1,000.
+        (These are the original hand figures; only the DATE moved, to keep a
+        real STCG case in the oracle after the boundary rule landed.)
+        """
+        pool = InvestmentPool("Debt", stcg_tax=0.20, ltcg_tax=0.10)
+        pool.invest(pd.Timestamp("2026-01-01"), 100_000, nav=100)
+        res = pool.redeem_net_amount(pd.Timestamp("2026-12-30"), 54_000, nav=110)
+        assert (pd.Timestamp("2026-12-30") - pd.Timestamp("2026-01-01")).days == 363
         assert -res["units"] == pytest.approx(500.0, abs=1e-9)
         assert res["tax"] == pytest.approx(1_000.0, abs=1e-6)
         assert res["net_received"] == pytest.approx(54_000.0, abs=1e-6)
@@ -169,36 +193,82 @@ class TestCorpusRequiredOracle:
 # ---------------------------------------------------------------------------
 
 
-class TestPoolWindowOracle:
-    def test_first_cycle_refills_match_window_sums(self):
-        """Payouts at months +12 (120k), +30 (130k), +47 (140k), +49 (150k)
-        from sim start. Zero return / zero tax ⇒ refill = plain window sum.
+class TestGridWindowOracle:
+    """v2 replacement for the pool-window oracle (the pools are gone).
 
-        Hand (first annual cycle at sim start):
-          Debt   window [0, 24m)  → 120,000
-          Hybrid window [24m, 48m) → 130,000 + 140,000 = 270,000
-          month-49 payout excluded from cycle 1 entirely.
+    What the old test pinned - "the right money is provisioned for the right
+    window, and every payout is funded exactly once" - is now a property of
+    the grid, so it is checked against hand-computed grid shares instead.
+    """
+
+    def test_grid_carves_hand_computed_shares(self):
+        """A non-negotiable cashflow 4.6 years out, PLAN at 2026-06-01.
+
+        Hand, straight off the grid (rows are floor(t), t on 365.25):
+          t = 4.63 y -> row 4 -> 0% debt, 25% hybrid  -> first carve 25%
+          then row 3 (25/25), row 2 (50/25), row 1 (75/25), row 0 (100/0).
+        Successive rows add 25 points each time, and the hybrid quarter is
+        carried from row 4 to row 1 before converting to debt at row 0.
+        So there are exactly four slices of 25%, one of them hybrid-then-debt,
+        and they sum to 100% of the cashflow.
         """
-        start = TODAY
-        payouts = pd.DataFrame({
-            "Date": [start + pd.DateOffset(months=m) for m in (12, 30, 47, 49)],
-            "Amount": [120_000.0, 130_000.0, 140_000.0, 150_000.0],
-        })
-        final = start + pd.DateOffset(months=60)
-        nav = generate_pseudo_nav(start, final, 0.0)
-        pool_trans, repl, fail_date, fail_reason, _ = simulate_pool(
-            payouts, nav, nav, _ZERO, _ZERO, start, final)
-        assert fail_date is None
+        cf = TODAY + pd.DateOffset(years=4, months=7)   # ~4.63 years out
+        plan = grid_slice_plan("non-negotiable", cf, TODAY)
 
-        first_cycle = repl[repl["Date"] == start]
-        debt = first_cycle[first_cycle["Description"] == "Replenishment: Debt Pool"]
-        hybrid = first_cycle[first_cycle["Description"] == "Replenishment: Hybrid Pool"]
-        assert float(debt["Amount"].sum()) == pytest.approx(120_000.0, abs=0.02)
-        assert float(hybrid["Amount"].sum()) == pytest.approx(270_000.0, abs=0.02)
-        # Cycle-1 total must NOT include the month-49 payout.
-        assert float(first_cycle["Amount"].sum()) == pytest.approx(390_000.0, abs=0.05)
-        # Across the whole horizon every payout is funded exactly once.
-        assert float(repl["Amount"].sum()) == pytest.approx(540_000.0, abs=0.10)
+        assert [round(sl["share"], 10) for sl in plan] == [0.25, 0.25, 0.25, 0.25]
+        assert sum(sl["share"] for sl in plan) == pytest.approx(1.0)
+
+        hybrid_first = [sl for sl in plan if sl["hops"][0][0] == "hybrid"]
+        assert len(hybrid_first) == 1                      # only the row-4 quarter
+        assert [h[0] for h in hybrid_first[0]["hops"]] == ["hybrid", "debt"]
+        assert all(len(sl["hops"]) == 1 for sl in plan if sl not in hybrid_first)
+
+    def test_beyond_the_reach_nothing_is_carved(self):
+        """Reach is 5 / 4 / 3 years by column. A cashflow at 4.6 years is
+        inside for non-negotiable, outside for both others - so the negotiable
+        and semi-negotiable plans start later, and a 6-year cashflow is
+        outside every column (nothing is carved by anyone)."""
+        cf = TODAY + pd.DateOffset(years=4, months=7)
+        first_entry = {
+            neg: min(sl["hops"][0][1] for sl in grid_slice_plan(neg, cf, TODAY))
+            for neg in ("non-negotiable", "semi-negotiable", "negotiable")
+        }
+        assert first_entry["non-negotiable"] == TODAY      # already inside 5y
+        assert first_entry["semi-negotiable"] > TODAY      # waits for 4y
+        assert first_entry["negotiable"] > first_entry["semi-negotiable"]
+
+        far = TODAY + pd.DateOffset(years=6)
+        for neg in ("non-negotiable", "semi-negotiable", "negotiable"):
+            entry = min(sl["hops"][0][1] for sl in grid_slice_plan(neg, far, TODAY))
+            assert entry > TODAY                           # nothing carved today
+
+    def test_every_cashflow_funded_exactly_once(self):
+        """Four payouts across five years, all funded, none double-funded.
+
+        Zero return / zero tax, corpus exactly the sum of the payouts: the
+        plan is feasible with nothing to spare, which is only true if each
+        payout is provisioned once.
+        """
+        amounts = [120_000.0, 130_000.0, 140_000.0, 150_000.0]
+        goals = [{
+            "name": "P%d" % i, "type": "Non-Negotiable", "structure": "Lumpsum",
+            "start_date_mode": "Fixed",
+            "start_date": TODAY + pd.DateOffset(months=m),
+            "amount": a, "inflation_percent": 0.0,
+        } for i, (m, a) in enumerate(zip((12, 30, 47, 49), amounts))]
+        cfg = {
+            "current_date": TODAY, "current_age": 45, "target_lifetime": 90,
+            "current_corpus": sum(amounts), "investment_streams": [],
+            "goals": goals, "one_time_investments": [],
+        }
+        ok, _ft, fail, _pm, _gd, _c = run_simulation(
+            cfg, TODAY + pd.DateOffset(years=1), _ZERO_PARAMS)
+        assert ok is True and fail is None
+
+        cfg_short = dict(cfg, current_corpus=sum(amounts) - 1_000)
+        ok2, _ft2, fail2, _pm2, _gd2, _c2 = run_simulation(
+            cfg_short, TODAY + pd.DateOffset(years=1), _ZERO_PARAMS)
+        assert ok2 is False and fail2 is not None
 
 
 # ---------------------------------------------------------------------------
@@ -239,62 +309,77 @@ class TestStepUpOracle:
 # ---------------------------------------------------------------------------
 
 
-def _single_link_glide():
-    """Minimal chain: core corpus → debt (2y before goal end → end) → goal."""
-    return pd.DataFrame([
-        {"id": 1, "place": "debt", "years from inflow till end": 2,
-         "years from outflow till end": 0, "inflow_from": "core corpus",
-         "outflow_to": 2, "% of goal value": 100},
-        {"id": 2, "place": "goal", "years from inflow till end": 0,
-         "years from outflow till end": np.nan, "inflow_from": 1,
-         "outflow_to": np.nan, "% of goal value": 100},
-    ])
 
 
-class TestChainBackSolveOracle:
-    END = pd.Timestamp("2030-06-01")  # debt inflow 2028-06-01 → 730 d = 1.998631 y
+class TestSliceBackSolveOracle:
+    """The back-solve algebra, unchanged from v1's chains to v2's slices.
 
-    def _params(self, ret, tax):
-        return {"debt": {"return": ret, "stcg_tax": tax, "ltcg_tax": tax}}
+    v1 walked a glide-path chain link by link; v2 walks a slice's hops. Same
+    formula per leg - P = G / (g(1-tau) + tau) - so the hand-computed values
+    below are the ORIGINAL chain oracles, re-pointed at slice_principal.
+    """
+
+    START = pd.Timestamp("2028-06-01")
+    END = pd.Timestamp("2030-06-01")          # 730 days = 1.998631 y on 365.25
+
+    def _navs(self, rate):
+        months = pd.date_range(TODAY, pd.Timestamp("2032-01-01"), freq="MS")
+        return {place: {m: _nav_value(rate, TODAY, m) for m in months}
+                for place in ("core", "debt", "hybrid")}
+
+    def _params(self, tax):
+        return {"debt": {"return": 0.0, "stcg_tax": tax, "ltcg_tax": tax},
+                "hybrid": {"return": 0.0, "stcg_tax": tax, "ltcg_tax": tax},
+                "core": {"return": 0.0, "stcg_tax": tax, "ltcg_tax": tax}}
 
     def test_no_tax_pure_discounting(self):
-        """G = 1,000,000 held 730 days at 12%, τ=0.
+        """G = 1,000,000 held 730 days at 12%, tau = 0.
 
-        Hand: t = 730/365.25 = 1.998631 y → growth = 1.12^t = 1.254206…
-        → P = 1,000,000 / 1.254206 = 797,317.56 (engine rounds to 2 dp;
-        assert ±1 for the rounding of intermediate steps).
+        Hand: t = 730/365.25 = 1.998631 y -> growth = 1.12^t = 1.254206...
+        -> P = 1,000,000 / 1.254206 = 797,317.56.
+        (The engine's pseudo-NAV compounds daily on a 365-day year, so the
+        growth factor differs in the 5th decimal; abs=250 covers that.)
         """
-        df = calculate_goal_cashflows(_single_link_glide(), self.END, 1_000_000,
-                                      self._params(0.12, 0.0), {"current_date": TODAY})
-        goal_row = df[df["place"] == "goal"].iloc[0]
-        debt_row = df[df["place"] == "debt"].iloc[0]
-        assert goal_row["inflow_amount"] == pytest.approx(1_000_000.0, abs=0.01)
-        assert debt_row["inflow_amount"] == pytest.approx(797_317.56, abs=1.0)
-        # The link's own outflow reconciles: principal grows back to the goal.
-        assert debt_row["total_outflow_amount"] == pytest.approx(1_000_000.0, abs=1.0)
-        assert debt_row["tax_out_of_outflow"] == pytest.approx(0.0, abs=0.01)
+        got = slice_principal(1_000_000.0, [("debt", self.START, self.END)],
+                              self.START, self._navs(0.12), self._params(0.0),
+                              _STCG_MAX_YEARS)
+        assert got == pytest.approx(797_317.56, abs=250.0)
 
     def test_ltcg_back_solve(self):
-        """Same chain with τ = 10% (held ~2y > 1y → LTCG).
+        """Same leg with tau = 10% (held ~2y > 1y -> LTCG).
 
-        Hand: P = G / (g(1−τ)+τ) with g = 1.12^1.998631 = 1.254206…
-        → P = 1,000,000 / (1.254206×0.9 + 0.1) = 813,812.10 (±1).
+        Hand: P = G / (g(1-tau)+tau), g = 1.12^1.998631 = 1.254206...
+        -> P = 1,000,000 / (1.254206x0.9 + 0.1) = 813,812.10.
         """
-        df = calculate_goal_cashflows(_single_link_glide(), self.END, 1_000_000,
-                                      self._params(0.12, 0.10), {"current_date": TODAY})
-        debt_row = df[df["place"] == "debt"].iloc[0]
-        assert debt_row["inflow_amount"] == pytest.approx(813_812.10, abs=1.0)
-        # Verify the round trip from the engine's own outflow figures:
-        # outflow − tax must equal the goal target.
-        net = debt_row["total_outflow_amount"] - debt_row["tax_out_of_outflow"]
-        assert net == pytest.approx(1_000_000.0, abs=1.0)
+        got = slice_principal(1_000_000.0, [("debt", self.START, self.END)],
+                              self.START, self._navs(0.12), self._params(0.10),
+                              _STCG_MAX_YEARS)
+        assert got == pytest.approx(813_812.10, abs=250.0)
 
     def test_zero_return_principal_equals_goal(self):
-        """r = 0 ⇒ no gain ⇒ tax irrelevant ⇒ P = G for any τ."""
-        df = calculate_goal_cashflows(_single_link_glide(), self.END, 1_000_000,
-                                      self._params(0.0, 0.99), {"current_date": TODAY})
-        debt_row = df[df["place"] == "debt"].iloc[0]
-        assert debt_row["inflow_amount"] == pytest.approx(1_000_000.0, abs=0.01)
+        """r = 0 => no gain => tax irrelevant => P = G for any tau."""
+        got = slice_principal(1_000_000.0, [("debt", self.START, self.END)],
+                              self.START, self._navs(0.0), self._params(0.99),
+                              _STCG_MAX_YEARS)
+        assert got == pytest.approx(1_000_000.0, abs=0.01)
+
+    def test_two_hop_slice_taxes_both_legs(self):
+        """A hybrid->debt slice pays tax at the SWITCH as well as at the goal.
+
+        Hand, zero-growth so only the tax terms bite: with tau = 0 on both
+        legs P = G; with tau > 0 and growth > 0, the two-hop principal must
+        exceed the one-hop principal over the same total span, because the
+        switch realises a gain mid-way and taxes it.
+        """
+        mid = pd.Timestamp("2029-06-01")
+        navs, params = self._navs(0.12), self._params(0.125)
+        one_hop = slice_principal(1_000_000.0, [("debt", self.START, self.END)],
+                                  self.START, navs, params, _STCG_MAX_YEARS)
+        two_hop = slice_principal(
+            1_000_000.0,
+            [("hybrid", self.START, mid), ("debt", mid, self.END)],
+            self.START, navs, params, _STCG_MAX_YEARS)
+        assert two_hop > one_hop
 
 
 # ---------------------------------------------------------------------------

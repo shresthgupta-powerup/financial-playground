@@ -26,6 +26,9 @@ import pandas as pd
 #   Lifetime mode     → unconditional violation (unbounded by construction)
 # Implied per-frequency maxima: 49 Monthly / 17 Quarterly / 9 Half-Yearly /
 # 5 Annual.  Replenishing recurring goals are payout rows only and stay uncapped.
+# v2 (2026-08-24): the span cap is RETIRED - goals of any length are valid;
+# cashflows beyond the grid's reach simply wait for their window (purpose is
+# derived, not typed). Constant kept only so old imports don't break.
 MAX_NONREPLENISHING_SPAN_MONTHS = 48
 
 _VALID_FREQUENCIES = {"Monthly", "Quarterly", "Half-Yearly", "Annual"}
@@ -43,54 +46,8 @@ class PlanValidationError(ValueError):
         super().__init__("; ".join(self.errors))
 
 
-def _is_replenishing(goal):
-    return str(goal.get("nature", "")).lower() == "replenishing"
 
 
-def _nonreplenishing_span_months(goal):
-    """First-to-last occurrence span in months for a NON-replenishing recurring goal.
-
-    Mirrors ``engine._resolve_recurring_occurrences`` for the relevant ``end_mode``
-    branches but is self-contained (validation must not depend on the engine, to
-    avoid an import cycle).
-
-    Returns (span_months, is_lifetime) where is_lifetime=True signals an
-    unconditional violation (Lifetime end_mode on a non-replenishing goal).
-    When the frequency is invalid, returns (0, False) so the existing frequency
-    error fires instead of a spurious span error.
-    """
-    if goal.get("structure") != "Recurring":
-        return 0, False
-
-    end_mode = goal.get("end_mode") or "Occurrences"
-    freq_months = _FREQ_TO_MONTHS.get(goal.get("frequency"))
-
-    if end_mode == "Lifetime":
-        # Unbounded by construction — unconditional violation.
-        return MAX_NONREPLENISHING_SPAN_MONTHS + 1, True
-
-    if freq_months is None:
-        # Invalid frequency — let the frequency-error path handle it.
-        return 0, False
-
-    if end_mode == "Occurrences":
-        occ = int(goal.get("occurrences", 1) or 1)
-        # span = (occ - 1) * freq_months  (first occurrence is at offset 0)
-        return max(0, (occ - 1) * freq_months), False
-
-    if end_mode == "Fixed date":
-        start = goal.get("start_date")
-        end = goal.get("end_date")
-        if start is None or end is None:
-            return 0, False
-        start = pd.Timestamp(start)
-        end = pd.Timestamp(end)
-        if end < start:
-            return 0, False
-        months_span = (end.year - start.year) * 12 + (end.month - start.month)
-        return months_span, False
-
-    return 0, False
 
 
 def validate_plan_config(config):
@@ -183,20 +140,6 @@ def validate_plan_config(config):
                     errors.append(f"{label}: Fixed-date end_mode requires an end_date")
                 elif start is not None and pd.Timestamp(end) < pd.Timestamp(start):
                     errors.append(f"{label}: end_date must be on or after start_date")
-
-            # Span cap (D-P208-1) — non-replenishing recurring only.
-            if not _is_replenishing(goal):
-                span_months, is_lifetime = _nonreplenishing_span_months(goal)
-                if is_lifetime:
-                    errors.append(
-                        f"{label}: non-replenishing recurring goal with Lifetime end_mode "
-                        f"spans more than 4 years; shorten it or model it as a Replenishing goal."
-                    )
-                elif span_months > MAX_NONREPLENISHING_SPAN_MONTHS:
-                    errors.append(
-                        f"{label}: non-replenishing recurring goal spans {span_months} months "
-                        f"— more than 4 years; shorten it or model it as a Replenishing goal."
-                    )
 
     # --- One-time investments ---------------------------------------------
     one_time = config.get("one_time_investments", []) or []

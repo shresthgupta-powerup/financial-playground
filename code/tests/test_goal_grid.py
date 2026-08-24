@@ -140,7 +140,9 @@ class TestTaxLayer:
     """Layer 4 follows the engine's existing gross-up convention."""
 
     def test_gross_up_matches_engine_convention(self):
-        from app.planning.engine import calculate_goal_cashflows  # noqa: F401
+        # v2: the engine's gross-up lives in grid_engine.slice_principal (the
+        # chain walker it used to mirror is gone). Same algebra, one leg.
+        from app.planning.grid_engine import slice_principal  # noqa: F401
         target, ret, t = 100_000.0, 0.06, 3.0
         ltcg = _DEFAULT_INSTRUMENT_PARAMS["debt"]["ltcg_tax"]
         got = gg.gross_up_for_tax(target, ret, t, 0.20, ltcg)
