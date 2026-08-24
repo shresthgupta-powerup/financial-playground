@@ -32,6 +32,8 @@ from .validation import validate_plan_config
 # Bump this whenever the engine's numeric behaviour changes, so two saved plans
 # with the same stamp always reproduce.
 ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe+goaltaxequity"
+# Bump alongside ENGINE_SOURCE_SHA - shown in the app header as "updated ...".
+ENGINE_UPDATED = "2026-08-24"
 
 # Taxation of goal money ("+goaltaxequity", 2026-08-24, per advisory desk):
 # ALL goal buckets are equity-taxed - the "debt" bucket holds ARBITRAGE funds

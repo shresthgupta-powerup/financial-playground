@@ -30,6 +30,11 @@ from app.planning import (
     run_simulation,
     validate_plan_config,
 )
+import app.planning as _planning
+
+# Fallback covers a hot-reloaded app running against a stale cached engine
+# module (Streamlit Cloud pulls code without restarting Python until reboot).
+ENGINE_UPDATED = getattr(_planning, "ENGINE_UPDATED", "2026-08-24")
 from app.planning.advisor_export import build_advisor_workbook
 from app.planning.engine import (
     _DEFAULT_INSTRUMENT_PARAMS,
@@ -1754,9 +1759,10 @@ def main() -> None:
     # NB: this engine is no longer the untouched handoff copy — it is the sole
     # Financial Plan build and has deliberate changes on top (DECISIONS.md).
     st.caption(
-        f"Engine `{ENGINE_SOURCE_SHA}` · glide paths v{GLIDEPATH_VERSION} — the "
-        "sole Financial Plan build, forked from the CRM handoff (2026-07-17); "
-        "every engine change since is logged in `v3_docs/DECISIONS.md`."
+        f"Engine `{ENGINE_SOURCE_SHA}` · **updated {ENGINE_UPDATED}** · "
+        f"glide paths v{GLIDEPATH_VERSION} — the sole Financial Plan build, "
+        "forked from the CRM handoff (2026-07-17); every engine change since "
+        "is logged in `v3_docs/DECISIONS.md`."
     )
 
     # Sidebar: personal & corpus + risk profile. Defaults come from

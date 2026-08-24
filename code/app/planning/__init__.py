@@ -22,6 +22,7 @@ from .glide_paths import GLIDEPATH_VERSION, get_glide_paths
 from .validation import PlanValidationError, validate_plan_config, MAX_NONREPLENISHING_SPAN_MONTHS
 from .engine import (
     ENGINE_SOURCE_SHA,
+    ENGINE_UPDATED,
     find_retirement_date,
     run_simulation,
     TaxLot,
@@ -35,6 +36,7 @@ __all__ = [
     "validate_plan_config",
     "MAX_NONREPLENISHING_SPAN_MONTHS",
     "ENGINE_SOURCE_SHA",
+    "ENGINE_UPDATED",
     "find_retirement_date",
     "run_simulation",
     "TaxLot",
