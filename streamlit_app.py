@@ -1776,8 +1776,33 @@ def main() -> None:
         st.caption(
             f"Core-corpus return the engine will use: "
             f"**{RISK_PROFILE_CORE_RETURNS[risk_profile] * 100:g}%** · "
-            "fixed pool returns: debt 6%, hybrid 10%."
+            f"debt {_DEFAULT_INSTRUMENT_PARAMS['debt']['return'] * 100:g}%, "
+            f"hybrid {_DEFAULT_INSTRUMENT_PARAMS['hybrid']['return'] * 100:g}%."
         )
+        # These two assumptions are fundamental to every number the tool
+        # produces, so they are stated in the UI rather than buried in code.
+        # Values are read from the engine itself so they can never drift.
+        with st.expander("Model assumptions - returns & taxation"):
+            _dp = _DEFAULT_INSTRUMENT_PARAMS
+            st.markdown(
+                "**Returns (annual)**\n\n"
+                f"- Core corpus (equity): **{RISK_PROFILE_CORE_RETURNS[risk_profile] * 100:g}%**"
+                " - set by the risk profile\n"
+                f"- Hybrid: **{_dp['hybrid']['return'] * 100:g}%**\n"
+                f"- Debt: **{_dp['debt']['return'] * 100:g}%**\n\n"
+                "**Taxation - applied on every redemption, per FIFO tax lot**\n\n"
+                f"- **All buckets are equity-taxed**: "
+                f"{_dp['hybrid']['stcg_tax'] * 100:g}% on gains held under a year, "
+                f"{_dp['hybrid']['ltcg_tax'] * 100:g}% beyond. The debt bucket "
+                "holds **arbitrage funds** (debt-like return, equity taxation) "
+                "and the hybrid funds offered are equity-taxed.\n"
+                "- **Year-boundary rule**: a redemption within 1-2 days of "
+                f"completing a year is taxed as long-term "
+                f"({_dp['hybrid']['ltcg_tax'] * 100:g}%) - the desk shifts the "
+                "redemption to cross the year.\n\n"
+                "Tax is charged whenever money *moves*, not only when a goal is "
+                "paid - including transfers between buckets."
+            )
         st.divider()
         st.header("Retirement")
         # Internal mode value stays "target_age" for saved-file compatibility;

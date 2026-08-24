@@ -58,6 +58,21 @@ DEFAULT_GOAL_INFLATION = 0.06
 
 DAYS_PER_YEAR = 365.25  # load-bearing: decides which grid row a cashflow lands in
 
+# Taxation (mirrors engine._DEFAULT_INSTRUMENT_PARAMS, "+goaltaxequity"):
+# ALL goal money is EQUITY-taxed - the debt sleeve holds ARBITRAGE funds
+# (debt-like return, equity taxation) and the hybrid funds offered are
+# equity-taxed. Every redemption: 20% STCG (< 1 year) / 12.5% LTCG.
+# Boundary rule: a redemption within LTCG_GRACE_DAYS of completing one year
+# counts as LTCG - the desk shifts it 1-2 days to cross the year. This covers
+# the negotiable-goal wrinkle where money enters hybrid ~1 year before the
+# goal: held ~365 days -> 12.5%, never 20%.
+EQUITY_STCG_TAX = 0.20
+EQUITY_LTCG_TAX = 0.125
+LTCG_GRACE_DAYS = 2
+STCG_MAX_YEARS = (365 - LTCG_GRACE_DAYS) / DAYS_PER_YEAR
+DEFAULT_DEBT_TAX = (EQUITY_STCG_TAX, EQUITY_LTCG_TAX)
+DEFAULT_HYBRID_TAX = (EQUITY_STCG_TAX, EQUITY_LTCG_TAX)
+
 GOAL_REPLENISH = "GOAL_REPLENISH"
 GOAL_NON_REPLENISH = "GOAL_NON_REPLENISH"
 
@@ -119,11 +134,12 @@ def gross_up_for_tax(target_post_tax, annual_return, t_years, stcg_tax, ltcg_tax
     """Layer 4 helper - principal needed so the sleeve DELIVERS target net of tax.
 
     Identical convention to ``engine.calculate_required_inflow``: gains are taxed
-    at STCG when held a year or less, LTCG beyond.
+    at STCG under a year, LTCG beyond - with the boundary grace (see
+    ``STCG_MAX_YEARS``): within a couple of days of a full year counts as LTCG.
     """
     if t_years <= 0:
         return target_post_tax
-    tax_rate = stcg_tax if t_years <= 1 else ltcg_tax
+    tax_rate = stcg_tax if t_years <= STCG_MAX_YEARS else ltcg_tax
     growth_factor = (1 + annual_return) ** t_years
     return target_post_tax / (growth_factor * (1 - tax_rate) + tax_rate)
 
@@ -131,7 +147,7 @@ def gross_up_for_tax(target_post_tax, annual_return, t_years, stcg_tax, ltcg_tax
 def invest_today_taxed(amount, t_years, negotiability, inflation,
                        debt_growth=DEFAULT_DEBT_GROWTH,
                        hybrid_growth=DEFAULT_HYBRID_GROWTH,
-                       debt_tax=(0.20, 0.125), hybrid_tax=(0.20, 0.125)):
+                       debt_tax=DEFAULT_DEBT_TAX, hybrid_tax=DEFAULT_HYBRID_TAX):
     """Layer 4 - what must be carved TODAY so each sleeve delivers its share net."""
     if t_years < 0:
         return (0.0, 0.0)
@@ -162,7 +178,7 @@ def expand_goal_to_cashflows(goal, plan_date=None):
 
 def goal_sleeves(goal, plan_date, debt_growth=DEFAULT_DEBT_GROWTH,
                  hybrid_growth=DEFAULT_HYBRID_GROWTH, apply_tax=True,
-                 debt_tax=(0.20, 0.125), hybrid_tax=(0.20, 0.125)):
+                 debt_tax=DEFAULT_DEBT_TAX, hybrid_tax=DEFAULT_HYBRID_TAX):
     """Steps 1-3 for one goal: sleeves today, plus the derived purpose.
 
     Returns ``{debt, hybrid, purpose, inside, beyond, cashflows}``. ``purpose``

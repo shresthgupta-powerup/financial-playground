@@ -6,6 +6,62 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-24 - Goal money uniformly EQUITY-taxed + LTCG year-boundary grace (`+goaltaxequity`)
+
+**What changed:** Two coupled taxation decisions from the advisory desk
+(relayed by Shresth, 2026-08-24). Engine stamp bumped to
+`1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe+goaltaxequity`.
+
+1. **All goal buckets are equity-taxed.** The "debt" sleeve for goal money is
+   implemented with ARBITRAGE funds - debt-like return (6% assumption kept),
+   equity taxation - and the hybrid funds offered are equity-taxed. So every
+   redemption of goal money taxes at 20% STCG / 12.5% LTCG. The engine's debt
+   bucket is only ever goal money (chains + pools), so this is simply the
+   uniform rule. (An intermediate proposal to slab-tax debt at 30% was
+   considered the same week and dropped once the arbitrage-fund implementation
+   was confirmed - it never shipped.)
+
+2. **Year-boundary grace (`LTCG_GRACE_DAYS = 2`).** A redemption within 2 days
+   of completing one year is taxed as LTCG: operationally the desk shifts the
+   redemption 1-2 days to cross the year, so a lot held >= 364 days pays 12.5%,
+   never 20%. Applied at all three tax-decision sites: FIFO lot redemptions
+   (`InvestmentPool._get_tax_rate`), chain-leg sizing
+   (`calculate_goal_cashflows`), and pool injection sizing
+   (`calculate_debt_injection_need`).
+
+**Why it matters more than "edge case":** glide-path chains hop annually and
+pools refill annually, and an annual hop in a non-leap year spans exactly 365
+days - which the old `<= 365` rule taxed at STCG 20%. The grace flips every
+such hop to 12.5%. It also removes a latent asymmetry where the same 1-year hop
+was STCG in a non-leap year but LTCG across a leap day. The motivating case:
+negotiable goals move money into hybrid ~1 year before the goal; held ~365
+days, it now correctly pays 12.5%.
+
+**Impact (replay of all 307 unique logged plans, before/after):**
+- 1 verdict flip, favorable: Prasad N v1 infeasible ("fails Jan 2040") ->
+  success (retire Aug 2026). A marginal plan whose late-life depletion the
+  tax saving compounds away.
+- 227 plans feasible in both: 212 retirement dates unchanged, 15 EARLIER by
+  1 month, 0 later. Median shift 0, mean -0.1 months.
+- 3 target-date plans: SIP-needed LOWER in all 3 (median -Rs 500/month).
+- 73 infeasible, 3 invalid, 3 target-infeasible: unchanged.
+- No plan got worse - the change is mathematically one-directional (tax rates
+  only ever fall or stay).
+
+**Golden masters re-baselined** (test_planning_engine.py, delta attribution in
+the docstrings): both parity retirement dates unchanged; funding cheaper by
+0.036% / 0.018%; config 1 loses its final Sep-2085 debt-pool refill event
+(pools slightly richer -> last top-up rounds to zero). The
+`test_tax_rate_by_holding_period` unit test now pins the 363/364-day boundary.
+
+**Where it surfaces in the UI:** the sidebar "Model assumptions - returns &
+taxation" expander states both rules (reads live from
+`_DEFAULT_INSTRUMENT_PARAMS`, so it cannot drift from the engine).
+
+**Revisit when:** the desk stops using arbitrage funds for the debt sleeve
+(taxation would need to be re-split per bucket), or equity STCG/LTCG rates
+change in a Finance Act.
+
 ## 2026-08-20 — Duplicate goal names no longer silently drop a goal (`+goaldedupe`)
 
 **What changed:** `run_simulation` disambiguates non-replenishing goal names

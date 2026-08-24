@@ -149,7 +149,7 @@ class TestParityGoldenMaster:
     def test_glidepath_version_pinned(self):
         assert GLIDEPATH_VERSION == 1
         assert engine.ENGINE_SOURCE_SHA == (
-            "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe")
+            "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe+goaltaxequity")
 
     def test_parity_config_1_retirement_date(self):
         res = find_retirement_date(_parity_config_1())
@@ -157,52 +157,52 @@ class TestParityGoldenMaster:
         assert res["retirement_date"] == pd.Timestamp("2032-09-01")
 
     def test_parity_config_1_snapshot_totals(self):
-        """Golden-master RE-BASELINED for +poolprefund (2026-08-11).
+        """Golden-master RE-BASELINED for +goaltaxequity (2026-08-24).
 
-        Previously re-baselined for +monthgrid (Plan 223, 2026-06-17).
+        Previously re-baselined for +poolprefund (2026-08-11), before that
+        +monthgrid (Plan 223, 2026-06-17).
 
-        The Debt/Hybrid pools now start provisioning up to 48 months before the
-        first net payout instead of on the payout date itself (DECISIONS.md
-        2026-08-11). This config's Replenishing "Retirement Income" starts at
-        retirement (Sep 2032); pre-funding now begins Sep 2029 — 36 months
-        earlier, the point at which those payouts first enter the pools'
-        48-month lookahead.
+        Goal money is now uniformly EQUITY-taxed (the debt sleeve holds
+        arbitrage funds), and a redemption within LTCG_GRACE_DAYS (2) of a
+        full year counts as LTCG (DECISIONS.md 2026-08-24). The binding effect
+        here is the boundary rule: annual glide-path hops and pool refill
+        cycles span 365 days in non-leap years, which the old `<= 365` rule
+        taxed at STCG 20%; they now tax at LTCG 12.5%.
 
-        Retirement date UNCHANGED (2032-09-01) — the solver is unaffected.
+        Retirement date UNCHANGED (2032-09-01) - the saving is too small to
+        move the solver a month.
 
-        Delta attribution (+monthgrid baseline -> +poolprefund):
-          len(ft):    136 -> 138  (+2 = the extra annual pool-refill events
-                      during the 3-year ramp; NOT a systemic change — a
-                      systemic one would add dozens)
-          Amount.sum: -425,161,503 -> -424,574,896  (+586,607, +0.138%)
-          units.sum:  921.48 -> 260.72  (-71.7%)
-          tax.sum:    53,168,584 -> 53,078,485  (-90,099, -0.170%)
-          Core Corpus Value (last): 83,071,801 -> 23,503,740  (-71.7%)
+        Delta attribution (+poolprefund baseline -> +goaltaxequity):
+          len(ft):    138 -> 137  (-1: the FINAL annual "Replenishment: Debt
+                      Pool" event, Sep 2085, disappears - cheaper taxation
+                      leaves the pools slightly richer, so the last year's
+                      injection need is zero and the event is skipped.
+                      Verified by row-level diff on (Date, Description).)
+          Amount.sum: -424,574,896 -> -424,422,147  (+152,750, +0.036%)
+          units.sum:  260.72 -> 314.00  (+20.44%)
+          tax.sum:    53,078,485 -> 53,060,745  (-17,740, -0.033%)
+          Core Corpus Value (last): 23,503,740 -> 28,307,534  (+20.44%)
 
-        units.sum and Core Corpus Value (last) move by the SAME -71.7067%
-        because they are the same quantity (residual units x final NAV) — an
-        internal consistency check that passes. The residual falls because ~4
-        years of payouts leave equity (12%) for debt/hybrid (6%/10%) three years
-        earlier; that one-time drag then compounds across the remaining ~54
-        years of the plan, and the terminal residual is a small difference of
-        large numbers, so it moves far more than proportionally. Steady-state
-        pool sizing after the first payout is unchanged.
-
-        This is the intended cost of removing the provisioning cliff.
-        No unexplained drift — reconciliation PASS.
+        units.sum and Core Corpus Value (last) move by the SAME +20.4385%
+        (same quantity, two views) - consistency check PASS. As with prior
+        re-baselines, the terminal residual is a small difference of large
+        numbers, so a 0.036% funding saving compounds into a +20% residual.
+        Every delta is favorable (less outflow, less tax, more residual),
+        which is the only direction this change can move.
+        No unexplained drift - reconciliation PASS.
         """
         cfg = _parity_config_1()
         res = find_retirement_date(cfg)
         rd = res["retirement_date"]
         success, ft, fail, pm, gd, comp = run_simulation(cfg, rd, _DEFAULT_INSTRUMENT_PARAMS)
         assert success is True
-        assert len(ft) == 138
-        assert ft["Amount"].sum() == pytest.approx(-424574896.688345, rel=1e-9)
-        assert ft["units"].sum() == pytest.approx(260.7160668148, rel=1e-9)
-        assert ft["tax"].sum() == pytest.approx(53078485.185414, rel=1e-9)
+        assert len(ft) == 137
+        assert ft["Amount"].sum() == pytest.approx(-424422147.024181, rel=1e-9)
+        assert ft["units"].sum() == pytest.approx(314.0023200459, rel=1e-9)
+        assert ft["tax"].sum() == pytest.approx(53060745.134476, rel=1e-9)
         assert sorted(gd.keys()) == ["Retirement Home"]
         assert len(comp) == 720
-        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(23503739.794575, rel=1e-9)
+        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(28307533.614697, rel=1e-9)
 
     def test_parity_config_2_retirement_date(self):
         res = find_retirement_date(_parity_config_2())
@@ -210,45 +210,43 @@ class TestParityGoldenMaster:
         assert res["retirement_date"] == pd.Timestamp("2028-02-01")
 
     def test_parity_config_2_snapshot_totals(self):
-        """Golden-master RE-BASELINED for +poolprefund (2026-08-11).
+        """Golden-master RE-BASELINED for +goaltaxequity (2026-08-24).
 
-        Previously re-baselined for +monthgrid (Plan 223, 2026-06-17).
+        Previously re-baselined for +poolprefund (2026-08-11), before that
+        +monthgrid (Plan 223, 2026-06-17).
 
-        Same change as config 1, but this config exercises the OTHER branch:
-        its first payout is Jan 2027, only 8 months after the plan start
-        (May 2026), so the 48-month ramp is clamped by the ``current_date``
-        floor and pre-funding begins at the plan start — 8 months of ramp, not
-        36. This is the deliberate "no runway" case: a payout too soon to glide
-        into still provisions in one bite, because there is no earlier month to
-        provision in.
+        Same change as config 1 (uniform equity taxation + LTCG boundary
+        grace). This config's plan is much shorter (33 years of comp vs 60),
+        so fewer annual hops flip from 20% to 12.5% and every delta is
+        smaller.
 
         Retirement date UNCHANGED (2028-02-01).
 
-        Delta attribution (+monthgrid baseline -> +poolprefund):
-          len(ft):    62 -> 64  (+2 ramp refill events)
-          Amount.sum: -89,382,345 -> -88,697,219  (+685,126, +0.767%)
-          units.sum:  3003.81 -> 1941.43  (-35.4%)
-          tax.sum:    11,221,733 -> 11,130,370  (-91,363, -0.814%)
-          Core Corpus Value (last): 12,671,024 -> 8,189,542  (-35.4%)
+        Delta attribution (+poolprefund baseline -> +goaltaxequity):
+          len(ft):    64 -> 64  (unchanged - no refill event drops out here)
+          Amount.sum: -88,697,219 -> -88,681,425  (+15,794, +0.018%)
+          units.sum:  1941.43 -> 2045.09  (+5.34%)
+          tax.sum:    11,130,370 -> 11,129,813  (-557, -0.005%)
+          Core Corpus Value (last): 8,189,542 -> 8,626,826  (+5.34%)
 
         units.sum and Core Corpus Value (last) again move by an identical
-        -35.3680% (same quantity, two views) — consistency check PASS. The
-        residual drop is roughly half config 1's because the ramp here is 8
-        months, not 36, so less time is spent out of equity.
-        No unexplained drift — reconciliation PASS.
+        +5.3395% (same quantity, two views) - consistency check PASS. All
+        deltas favorable, same direction as config 1, smaller magnitude for
+        the shorter plan - cross-config coherence PASS.
+        No unexplained drift - reconciliation PASS.
         """
         cfg = _parity_config_2()
         res = find_retirement_date(cfg)
         rd = res["retirement_date"]
         success, ft, fail, pm, gd, comp = run_simulation(cfg, rd, _DEFAULT_INSTRUMENT_PARAMS)
         assert success is True
-        assert len(ft) == 64
-        assert ft["Amount"].sum() == pytest.approx(-88697219.273701, rel=1e-9)
-        assert ft["units"].sum() == pytest.approx(1941.4264998082, rel=1e-9)
-        assert ft["tax"].sum() == pytest.approx(11130369.954144, rel=1e-9)
+        assert len(ft) == 64  # unchanged under +goaltaxequity
+        assert ft["Amount"].sum() == pytest.approx(-88681424.829336, rel=1e-9)
+        assert ft["units"].sum() == pytest.approx(2045.0897700778, rel=1e-9)
+        assert ft["tax"].sum() == pytest.approx(11129812.822121, rel=1e-9)
         assert sorted(gd.keys()) == ["Marriage Elder", "Marriage Younger"]
         assert len(comp) == 396
-        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(8189541.890101, rel=1e-9)
+        assert comp["Core Corpus Value"].iloc[-1] == pytest.approx(8626825.863726, rel=1e-9)
 
     def test_glide_paths_byte_match_columns(self):
         gp = get_glide_paths()
@@ -655,8 +653,12 @@ class TestInvestmentPool:
 
     def test_tax_rate_by_holding_period(self):
         pool = InvestmentPool("Debt", 0.20, 0.125)
-        # <= 365 days → STCG; > 365 → LTCG
-        assert pool._get_tax_rate(TODAY, TODAY + pd.Timedelta(days=365)) == 0.20
+        # +goaltaxequity boundary rule: within LTCG_GRACE_DAYS (2) of a full
+        # year counts as LTCG (the desk shifts the redemption 1-2 days to
+        # cross the year). STCG only when genuinely short: <= 363 days.
+        assert pool._get_tax_rate(TODAY, TODAY + pd.Timedelta(days=363)) == 0.20
+        assert pool._get_tax_rate(TODAY, TODAY + pd.Timedelta(days=364)) == 0.125
+        assert pool._get_tax_rate(TODAY, TODAY + pd.Timedelta(days=365)) == 0.125
         assert pool._get_tax_rate(TODAY, TODAY + pd.Timedelta(days=366)) == 0.125
 
     def test_unrealized_tax_only_on_gains(self):

@@ -31,7 +31,21 @@ from .validation import validate_plan_config
 # coercion (all input dates snapped to day=1, step-up anchor -> current_date).
 # Bump this whenever the engine's numeric behaviour changes, so two saved plans
 # with the same stamp always reproduce.
-ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe"
+ENGINE_SOURCE_SHA = "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe+goaltaxequity"
+
+# Taxation of goal money ("+goaltaxequity", 2026-08-24, per advisory desk):
+# ALL goal buckets are equity-taxed - the "debt" bucket holds ARBITRAGE funds
+# (debt-like ~6% return, equity taxation), and the hybrid funds offered are
+# equity-taxed. So every redemption of goal money is 20% STCG / 12.5% LTCG.
+#
+# Boundary rule: a redemption within LTCG_GRACE_DAYS of completing one year is
+# treated as LTCG - operationally the desk shifts the redemption by 1-2 days to
+# cross the year, so a lot held >= 364 days taxes at 12.5%, never 20%. This
+# also removes a latent inconsistency where a 1-year glide hop was STCG in a
+# 365-day year but LTCG in a 366-day one.
+LTCG_GRACE_DAYS = 2
+_STCG_MAX_DAYS = 365 - LTCG_GRACE_DAYS          # held <= 363 days -> STCG
+_STCG_MAX_YEARS = _STCG_MAX_DAYS / 365.25       # same rule for fractional-year legs
 
 # Pool pre-funding horizon (2026-08-11, "+poolprefund"). The Debt/Hybrid pools
 # now begin provisioning up to this many months BEFORE the first net payout
@@ -83,7 +97,9 @@ class InvestmentPool:
 
     def _get_tax_rate(self, lot_date, redemption_date):
         holding_days = (pd.Timestamp(redemption_date) - pd.Timestamp(lot_date)).days
-        return self.stcg_tax if holding_days <= 365 else self.ltcg_tax
+        # Boundary rule (+goaltaxequity): within LTCG_GRACE_DAYS of a full year
+        # counts as LTCG - the desk shifts the redemption to complete the year.
+        return self.stcg_tax if holding_days <= _STCG_MAX_DAYS else self.ltcg_tax
 
     def invest(self, date, amount, nav, description="Investment"):
         if amount <= 0:
@@ -526,7 +542,7 @@ def calculate_goal_cashflows(input_df, end_date, goal_value_post_tax, instrument
 
             place = source_row['place'].lower()
             params = instrument_params.get(place, {'return': 0.0, 'stcg_tax': 0.0, 'ltcg_tax': 0.0})
-            tax_rate = params['stcg_tax'] if years <= 1 else params['ltcg_tax']
+            tax_rate = params['stcg_tax'] if years <= _STCG_MAX_YEARS else params['ltcg_tax']
 
             target_for_source = df.at[current_idx, 'inflow_amount']
             required_inflow = calculate_required_inflow(
@@ -558,7 +574,7 @@ def calculate_goal_cashflows(input_df, end_date, goal_value_post_tax, instrument
             principal = row['inflow_amount']
             total_outflow = principal * ((1 + params['return']) ** years)
             gains = total_outflow - principal
-            tax_rate = params['stcg_tax'] if years <= 1 else params['ltcg_tax']
+            tax_rate = params['stcg_tax'] if years <= _STCG_MAX_YEARS else params['ltcg_tax']
             tax = gains * tax_rate
 
             df.at[idx, 'total_outflow_amount'] = round(total_outflow, 2)
@@ -1220,7 +1236,7 @@ def calculate_debt_injection_need(expenses_list, injection_date, pool_params):
         # month. (Pairs with the month-aligned ``window_start`` filter in simulate_pool.)
         years_to_expense = max(0.0, (date - injection_date).days / 365.25)
 
-        tax_rate = stcg_tax if years_to_expense <= 1 else ltcg_tax
+        tax_rate = stcg_tax if years_to_expense <= _STCG_MAX_YEARS else ltcg_tax
         needed = calculate_corpus_required_for_future_expense(amount, years_to_expense, rate, tax_rate)
         total_pv += needed
 
