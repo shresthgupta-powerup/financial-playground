@@ -57,11 +57,32 @@ slice IS a chain: Core -> bucket [-> bucket] -> goal), and the comprehensive
 view keeps its column names. So the advisor workbook, the CSV, the Excel
 summary, the CRM export, and the version log all read v2 unchanged.
 
-**Impact (replay of all 307 unique logged plans, v1 -> v2):** see the replay
-report of this date. Retirement dates move LATER by a few months on plans with
-long income streams - v2 keeps a rolling 5-year book per cashflow and taxes
-every hop it actually takes, where v1's pool sized a flat 48-month lookahead.
-That is the intended cost of the model being honest about where money sits.
+**Impact (replay of all 311 unique logged plans, v1 -> v2):**
+
+- **The headline: v1 declared 28 plans dead in their FIRST MONTH. v2 fails
+  none of them there.** 2026 was v1's single largest failure bucket - larger
+  than any other year - and it was an artifact: a Non-replenishing goal's
+  chain inflow dates are clamped to `current_date`, so a goal two or three
+  years out demanded its ENTIRE provisioning on day one. (This is the same
+  cliff `+poolprefund` fixed for Replenishing goals in 2026-08-11; the chains
+  were never fixed. The grid removes it structurally for both.) Of those 28:
+  10 are now fully feasible, and all 18 that still fail now fail at a REAL
+  date, 2 to 13 years out - which is what a CM can actually act on.
+- 19 verdict changes overall: 14 infeasible -> success, 3 formerly `invalid`
+  (the retired span cap) now solve or fail honestly, and 2 success ->
+  infeasible (Prasad N v1/v9 - a no-income plan funding six education and
+  marriage goals off Rs 1.55 Cr; it runs dry at the last goal in Jan 2041.
+  Note its ORIGINAL logged verdict was also infeasible, so v2 restores what
+  the CM first saw; the 2026-08-24 tax change had briefly flipped it).
+- 227 plans feasible in both: 64 unchanged, 139 later (median +3 months, max
+  +20), 24 earlier. Later is the expected direction and the intended cost:
+  the grid parks goal money in debt/hybrid (6%/10%) up to five years ahead of
+  each cashflow instead of leaving it compounding in Core (12%), and it taxes
+  every hop that money actually takes.
+- 3 target-date plans: SIP-needed rises in all 3 (median +Rs 26,000/month),
+  same mechanism.
+
+**CMs must re-run their clients.** Every logged plan predates this change.
 
 **Golden masters re-baselined** with full delta attribution (parity config 1
 2032-09 -> 2033-01, config 2 2028-02 -> 2028-05; transaction counts rise from
