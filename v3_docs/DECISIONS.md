@@ -6,6 +6,48 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-25 - Wealth figures double-counted every rupee held for a goal
+
+**The bug:** the comprehensive view reports debt and hybrid TWICE by design -
+once as a total (`Debt Pool Value`, `Hybrid Pool Value`) and once broken down
+per goal (`<goal> Debt Value`, `<goal> Hybrid Value`). Four consumers summed
+every column ending in "Value", so all goal money was counted twice:
+
+- `build_snapshot` -> the "Wealth at retirement" metric, the Excel summary's
+  wealth split, and `snapshot_at_retirement` in the logged output JSON
+- `wealth_frame` -> the wealth chart AND the "Wealth at lifetime end" metric
+- `csv_with_summary` -> the CSV's "Total Wealth (Rs)" column
+
+**Why it appeared now:** in v1 those two column families were genuinely
+different money - the shared Debt/Hybrid pools funded Replenishing goals, and
+the per-goal columns held Non-replenishing glide-path chains. Nothing
+overlapped, so summing everything was correct. v2 made `Debt Pool Value` the
+total across all goals and kept the per-goal columns as its breakdown, which
+silently turned a correct sum into a double count. The engine's own maths was
+never wrong - only the reporting on top of it.
+
+**Caught by** the operator, from a live run (SIM-20260825-124919-119153): a
+client with a Rs 6.70 Cr corpus retiring in the CURRENT month was shown
+"Wealth at retirement Rs 7.20 Cr". With no income streams and no time to
+compound, wealth cannot rise Rs 50L in the retirement month - the gap was
+exactly the goal sleeves counted a second time.
+
+**Fix:** totals come from the three aggregate columns only
+(`_POOL_VALUE_COLS`). The per-goal sums stay in the snapshot dict and the
+Excel sheet, relabelled as "of which, by goal" so they read as the breakdown
+they are. Corrected figure for that client: Rs 6.76 Cr (corpus plus one month
+of growth).
+
+**Regression test:** `TestComprehensiveViewIsNotDoubleCounted` pins both
+halves - the aggregate column must equal the sum of the per-goal columns, and
+month-one total wealth must sit within 2% of the opening corpus. It also
+asserts that the naive "sum every ...Value column" figure is materially
+larger, so the test fails if anyone reintroduces that sum.
+
+**Revisit when:** a bucket ever holds money that is NOT attributable to a
+goal. Then the aggregate stops equalling the per-goal sum, and the difference
+becomes a real number worth reporting on its own.
+
 ## 2026-08-24 - v2: the GOAL GRID replaces glide-path chains and shared pools
 
 **What changed:** the goal model itself, per Punit's "4. Goal Planning" (§4.1-4.5)

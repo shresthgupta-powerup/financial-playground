@@ -1437,3 +1437,52 @@ class TestGridLongRecurringIsValidNow:
                   start=pd.Timestamp("2029-04-01"), amount=300_000,
                   frequency="Annual", occurrences=12, end_mode="Occurrences")
         validate_plan_config(_grid_config([g]))  # no raise
+
+
+class TestComprehensiveViewIsNotDoubleCounted:
+    """The aggregate columns and the per-goal columns are the SAME money.
+
+    v2 reports debt/hybrid twice on purpose: once in total ("Debt Pool Value")
+    and once broken down per goal ("<goal> Debt Value"). In v1 those were
+    genuinely different money - the shared pools versus the per-goal chains -
+    so anything summing every "...Value" column was correct. In v2 that same
+    sum double-counts every rupee held for a goal, which is exactly what shipped
+    on 2026-08-25 and showed a client with Rs 6.7 Cr as having Rs 7.2 Cr on his
+    retirement date. These tests pin the relationship so it cannot regress.
+    """
+
+    def _run(self):
+        cfg = _grid_config([
+            _goal(name="Income", type_="Non-Negotiable", structure="Recurring",
+                  start=TODAY + pd.DateOffset(months=1), amount=200_000,
+                  inflation=6.0, frequency="Monthly", occurrences=400,
+                  end_mode="Occurrences"),
+            _goal(name="Wedding", type_="Semi-Negotiable",
+                  start=pd.Timestamp("2029-06-01"), amount=5_000_000,
+                  inflation=7.0),
+        ], corpus=67_000_000)
+        ok, _ft, _f, _pm, _gd, comp = run_simulation(
+            cfg, TODAY, _DEFAULT_INSTRUMENT_PARAMS)
+        assert ok is True
+        return comp
+
+    def test_aggregate_equals_sum_of_per_goal_columns(self):
+        comp = self._run()
+        for bucket in ("Debt", "Hybrid"):
+            per_goal = [c for c in comp.columns if c.endswith(f" {bucket} Value")]
+            assert per_goal, f"no per-goal {bucket} columns to check"
+            agg = comp[f"{bucket} Pool Value"]
+            assert agg.sub(comp[per_goal].sum(axis=1)).abs().max() < 1.0
+
+    def test_total_wealth_starts_at_the_opening_corpus(self):
+        """Month one, no income and no payouts yet: total wealth is the corpus
+        plus one month of growth - NOT the corpus plus the goal sleeves again.
+        """
+        comp = self._run()
+        row = comp.iloc[0]
+        total = (row["Core Corpus Value"] + row["Debt Pool Value"]
+                 + row["Hybrid Pool Value"])
+        assert 67_000_000 <= total <= 67_000_000 * 1.02
+
+        naive = sum(row[c] for c in comp.columns if c.endswith("Value"))
+        assert naive > total * 1.1        # the bug this test exists to catch

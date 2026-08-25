@@ -285,9 +285,15 @@ def build_snapshot(comprehensive_df: pd.DataFrame, retirement_date: pd.Timestamp
     core = float(row.get("Core Corpus Value", 0) or 0)
     debt = float(row.get("Debt Pool Value", 0) or 0)
     hybrid = float(row.get("Hybrid Pool Value", 0) or 0)
+    # v2: "Debt Pool Value" is ALL debt held for goals, and the per-goal
+    # "<goal> Debt Value" columns are its breakdown - the same rupees seen two
+    # ways. Adding both double-counts every rupee of goal money (it did not in
+    # v1, where the pools and the per-goal chains were genuinely separate
+    # money). Total = the three aggregates; the per-goal sums are reported
+    # alongside as the split, never added in.
     goal_debt = float(sum(row.get(c, 0) or 0 for c in row.index if c.endswith(" Debt Value")))
     goal_hybrid = float(sum(row.get(c, 0) or 0 for c in row.index if c.endswith(" Hybrid Value")))
-    total = core + debt + hybrid + goal_debt + goal_hybrid
+    total = core + debt + hybrid
     return {
         "core": round(core, 2), "debt": round(debt, 2), "hybrid": round(hybrid, 2),
         "goal_debt": round(goal_debt, 2), "goal_hybrid": round(goal_hybrid, 2),
@@ -323,9 +329,11 @@ def wealth_frame(comprehensive_df: pd.DataFrame, death_date: pd.Timestamp) -> pd
     df = comprehensive_df.copy()
     df["Date"] = pd.to_datetime(df["Date"])
     df = df[df["Date"] <= death_date]
-    value_cols = [c for c in df.columns if c.endswith("Value")]
+    # Only the three aggregate columns; the per-goal columns break the SAME
+    # money down by goal and would double-count (see build_snapshot).
     out = pd.DataFrame({"Date": df["Date"]})
-    out["Total wealth"] = df[value_cols].fillna(0).sum(axis=1)
+    out["Total wealth"] = sum(
+        df[c].fillna(0) for c in _POOL_VALUE_COLS if c in df.columns)
     out["Core corpus"] = df.get("Core Corpus Value", 0)
     out["Debt pool"] = df.get("Debt Pool Value", 0)
     out["Hybrid pool"] = df.get("Hybrid Pool Value", 0)
@@ -340,7 +348,9 @@ def csv_with_summary(comprehensive_df: pd.DataFrame) -> bytes:
     out = comprehensive_df.copy()
     value_cols = [c for c in out.columns if c.endswith("Value")]
     goal_value_cols = [c for c in value_cols if c not in _POOL_VALUE_COLS]
-    out["Total Wealth (Rs)"] = out[value_cols].fillna(0).sum(axis=1)
+    # Aggregates only - the per-goal columns are a breakdown of the same money.
+    out["Total Wealth (Rs)"] = sum(
+        out[c].fillna(0) for c in _POOL_VALUE_COLS if c in out.columns)
     out["Goal Tranches (Rs)"] = out[goal_value_cols].fillna(0).sum(axis=1) if goal_value_cols else 0.0
     return out.to_csv(index=False).encode("utf-8")
 
@@ -858,10 +868,13 @@ def add_summary_sheet(xlsx_bytes: bytes, config: dict, *, kind: str,
                 fill=GREY_BG)
             ws.merge_cells(f"A{r}:I{r}")
             r += 1
-            for label, key in [("Core corpus", "core"), ("Debt pool", "debt"),
-                               ("Hybrid pool", "hybrid"),
-                               ("Goal tranches (debt)", "goal_debt"),
-                               ("Goal tranches (hybrid)", "goal_hybrid"),
+            # goal_debt / goal_hybrid are the per-goal breakdown of the debt
+            # and hybrid rows above, not extra money - so they are labelled as
+            # a split and excluded from Total.
+            for label, key in [("Core corpus", "core"), ("Debt held for goals", "debt"),
+                               ("Hybrid held for goals", "hybrid"),
+                               ("  of which, by goal (debt)", "goal_debt"),
+                               ("  of which, by goal (hybrid)", "goal_hybrid"),
                                ("Total", "total")]:
                 put(f"A{r}", label, size=10,
                     color="5A6472" if key != "total" else "1C2430",
