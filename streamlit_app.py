@@ -39,6 +39,7 @@ from app.planning.advisor_export import build_advisor_workbook
 from app.planning.engine import (
     _DEFAULT_INSTRUMENT_PARAMS,
     _resolve_goals,
+    _resolve_recurring_occurrences,
     expand_recurring_goal_to_tranches,
     format_inr,
 )
@@ -220,8 +221,22 @@ def goal_purpose(goal: dict, current_date) -> str:
     40-year income stream's later occurrences do. That is why the wording is
     about the window and not about the goal being endless.
     """
+    # Resolve the series length the way the engine does, so the derivation
+    # sees the real cashflows even BEFORE a run: a Lifetime series (or one
+    # starting at a not-yet-known retirement) outlives every carve window by
+    # construction, and a Fixed-date end implies its occurrence count.
+    # Without this, unresolved goals derived from a 1-occurrence stub -
+    # Retirement Income exported as "Non-replenishing" in the as-entered JSON.
+    if goal.get("structure") == "Recurring":
+        if (goal.get("end_mode") == "Lifetime"
+                or goal.get("start_date_mode") == "At retirement"):
+            return "Extends beyond the funding window"
     try:
         g = dict(goal)
+        if (g.get("structure") == "Recurring"
+                and g.get("end_mode") == "Fixed date"
+                and g.get("end_date") is not None):
+            g["occurrences"] = _resolve_recurring_occurrences(g, None)
         g["negotiability"] = g.get("type")
         g["structure"] = "recurring" if g.get("structure") == "Recurring" else "one-time"
         g["occurrences"] = g.get("occurrences") or 1

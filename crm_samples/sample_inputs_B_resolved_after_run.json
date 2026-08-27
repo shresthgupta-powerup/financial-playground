@@ -1,0 +1,147 @@
+{
+  "generated_at": "2026-08-27 18:38:26",
+  "simulation_id": "SIM-SAMPLE-CONTRACT-DEMO",
+  "retirement_mode": "earliest",
+  "target_date": null,
+  "target_age": null,
+  "engine_version": "v2grid+goaltaxequity+fixedstart",
+  "glidepath_version": 1,
+  "personal": {
+    "client_name": "Sample Client (contract demo)",
+    "phone": "9999999999",
+    "current_date": "2026-08-01",
+    "current_age": 40.0,
+    "target_lifetime": 90.0,
+    "current_corpus": 30000000.0,
+    "risk_profile": "Balanced"
+  },
+  "investment_streams": [
+    {
+      "name": "Salary",
+      "amount": 250000.0,
+      "start_date": "2026-08-01",
+      "end_date_mode": "At retirement",
+      "end_date": null,
+      "step_up_percent": 8.0,
+      "step_up_frequency": "Annual",
+      "step_up_date": "2026-08-01"
+    }
+  ],
+  "goals": [
+    {
+      "name": "Home Purchase Down Payment",
+      "description": "One-time, non-negotiable",
+      "type": "Non-negotiable",
+      "nature": "Non-replenishing",
+      "structure": "Lumpsum",
+      "start_date_mode": "Fixed",
+      "start_date": "2030-08-01",
+      "amount": 4000000.0,
+      "inflation_percent": 6.0
+    },
+    {
+      "name": "Marriage",
+      "description": "One-time, semi-negotiable",
+      "type": "Semi-negotiable",
+      "nature": "Replenishing",
+      "structure": "Lumpsum",
+      "start_date_mode": "Fixed",
+      "start_date": "2038-08-01",
+      "amount": 3000000.0,
+      "inflation_percent": 7.0
+    },
+    {
+      "name": "World Trip",
+      "description": "One-time, negotiable",
+      "type": "Negotiable",
+      "nature": "Replenishing",
+      "structure": "Lumpsum",
+      "start_date_mode": "Fixed",
+      "start_date": "2034-08-01",
+      "amount": 1500000.0,
+      "inflation_percent": 6.0
+    },
+    {
+      "name": "Child Education",
+      "description": "4 annual installments, fixed at admission",
+      "type": "Non-negotiable",
+      "nature": "Replenishing",
+      "structure": "Recurring",
+      "start_date_mode": "Fixed",
+      "start_date": "2036-08-01",
+      "amount": 1200000.0,
+      "frequency": "Annual",
+      "occurrences": 4,
+      "end_date": "2039-08-01",
+      "inflation_percent": 8.0,
+      "payments_fixed_at_start": true
+    },
+    {
+      "name": "Home Loan EMI",
+      "description": "Signed EMI, flat by contract",
+      "type": "Non-negotiable",
+      "nature": "Replenishing",
+      "structure": "Recurring",
+      "start_date_mode": "Fixed",
+      "start_date": "2026-08-01",
+      "amount": 45000.0,
+      "frequency": "Monthly",
+      "occurrences": 180,
+      "end_date": "2041-07-01",
+      "inflation_percent": 0.0,
+      "payments_fixed_at_start": true
+    },
+    {
+      "name": "Parents Support",
+      "description": "Quarterly, fixed end date",
+      "type": "Semi-negotiable",
+      "nature": "Replenishing",
+      "structure": "Recurring",
+      "start_date_mode": "Fixed",
+      "start_date": "2027-08-01",
+      "amount": 90000.0,
+      "frequency": "Quarterly",
+      "occurrences": 21,
+      "end_date": "2032-08-01",
+      "inflation_percent": 5.0,
+      "payments_fixed_at_start": true
+    },
+    {
+      "name": "Retirement Income",
+      "description": "Monthly income post-retirement",
+      "type": "Non-negotiable",
+      "nature": "Replenishing",
+      "structure": "Recurring",
+      "start_date_mode": "Fixed",
+      "start_date": "2031-09-01",
+      "amount": 125000.0,
+      "frequency": "Monthly",
+      "occurrences": 540,
+      "end_date": "2076-08-01",
+      "inflation_percent": 6.0,
+      "payments_fixed_at_start": false
+    },
+    {
+      "name": "Child Education 2",
+      "description": "Second child, same goal name",
+      "type": "Non-negotiable",
+      "nature": "Replenishing",
+      "structure": "Recurring",
+      "start_date_mode": "Fixed",
+      "start_date": "2040-08-01",
+      "amount": 1200000.0,
+      "frequency": "Annual",
+      "occurrences": 4,
+      "end_date": "2043-08-01",
+      "inflation_percent": 8.0,
+      "payments_fixed_at_start": true
+    }
+  ],
+  "one_time_investments": [
+    {
+      "name": "Bonus",
+      "date": "2027-08-01",
+      "amount": 1500000.0
+    }
+  ]
+}

@@ -30,11 +30,19 @@ someone remembering to tick it, and old plans loaded with it silently off.
 Deriving it applies the correct treatment to every plan - new, loaded, or
 replayed - with zero CM action.
 
-**Consequence for old plans:** re-running a saved plan with education or
-other non-income recurring goals now funds them FIXED - cheaper, so
-retirement dates can only move earlier or stay. Income goals are unaffected.
-A before/after replay of the full logged corpus accompanies this change (see
-the impact note below this entry once the replay lands).
+**Consequence for old plans - measured (311-plan replay, before/after):**
+- 14 plans flip infeasible -> success (Anmol Agrawal x4, Prasad N x2,
+  Mahesh Gunturu x2, Jaywant x2, R Jagannath, Playground, +2 more).
+  Prasad N lands back at "retire immediately" - his six education/marriage
+  goals were the over-provisioned kind.
+- Of 245 plans feasible in both: 109 unchanged, 136 EARLIER, 0 later.
+  Median -1 month, mean -8.6; the education/EMI-heavy tail is enormous -
+  Balla Pavan -160 months (13+ years), Ajit Gaginer -109, several -60s.
+  Compounding an 8-10% education rate across a whole payment series was
+  that much phantom cost.
+- Target-date plans: SIP-needed falls Rs ~48k/month median where it moves.
+- Direction is one-sided by construction: fixing payments can only reduce a
+  goal's cost. Income goals (Lifetime / At-retirement) are untouched.
 
 **Escape hatch, deliberate:** a genuinely escalating non-income series (rent
 with a contractual escalation clause) currently has no way to opt back in.
