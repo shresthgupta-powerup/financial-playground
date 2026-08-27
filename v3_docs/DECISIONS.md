@@ -6,6 +6,41 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-27 - Fixed-vs-inflating payments is POLICY, not a CM choice
+
+**What changed:** the `payments_fixed_at_start` checkbox (shipped 2026-08-25,
+live for two days) is REMOVED. The app now derives the treatment from the
+goal's shape - `payments_fixed_for()` in streamlit_app.py, the single source:
+
+> Every recurring goal is contract-fixed (escalate only to the first payment)
+> EXCEPT income-like series, which keep escalating throughout. "Income" is
+> structural, never a name: the goal starts At retirement, or its payments
+> run for Lifetime.
+
+The goal card states which rule applies (a lock / trend caption on every
+recurring goal), so the CM always sees the treatment - they just cannot
+change it. The engine is untouched: it still honours the explicit flag;
+`build_config` now sets it from policy. The CRM export still carries the
+resolved value per goal.
+
+**Why (operator, 2026-08-27):** the boss's call - this is a modelling truth,
+not a preference. Education installments do not rise mid-course any more than
+an EMI does; giving CMs a checkbox meant every plan's correctness depended on
+someone remembering to tick it, and old plans loaded with it silently off.
+Deriving it applies the correct treatment to every plan - new, loaded, or
+replayed - with zero CM action.
+
+**Consequence for old plans:** re-running a saved plan with education or
+other non-income recurring goals now funds them FIXED - cheaper, so
+retirement dates can only move earlier or stay. Income goals are unaffected.
+A before/after replay of the full logged corpus accompanies this change (see
+the impact note below this entry once the replay lands).
+
+**Escape hatch, deliberate:** a genuinely escalating non-income series (rent
+with a contractual escalation clause) currently has no way to opt back in.
+Accepted: no client plan has needed one; if one does, that is the two-rate
+extension flagged in the +fixedstart entry, not a return of the checkbox.
+
 ## 2026-08-25 - Contract-fixed payments: escalate to the FIRST payment only (`+fixedstart`)
 
 **What changed:** recurring goals gained `payments_fixed_at_start` (bool,
