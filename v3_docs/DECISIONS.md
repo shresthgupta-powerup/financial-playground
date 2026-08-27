@@ -6,6 +6,55 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-25 - Contract-fixed payments: escalate to the FIRST payment only (`+fixedstart`)
+
+**What changed:** recurring goals gained `payments_fixed_at_start` (bool,
+default off). On: the amount escalates at the goal's growth % from today to
+the FIRST payment, then every payment equals the first. Off (and absent):
+every payment escalates to its own date, exactly as before. One change point -
+`expand_recurring_goal_to_tranches` - everything downstream (grid carving,
+taxes, netting, settlement) just consumes dated amounts. Engine stamp bumped
+to `v2grid+goaltaxequity+fixedstart`.
+
+**Why:** an EMI is signed and college fees lock at admission - the payments
+are contractually fixed, but the engine escalated every one to its own date.
+A Rs 50k/month EMI starting in 3 years at 6% was funded as if the 240th
+payment were Rs 1.90L - an 88.9% overstatement of the whole goal. The only
+workaround was entering 0% growth with a hand-computed future amount (seen in
+the wild: Pankaj Bhatia's 0%-growth education goals).
+
+**Scope (operator decisions, 2026-08-25):**
+- EMIs / loan repayments, term-insurance premiums, any contractual fixed
+  outflow -> fixed. **Education too**: fees inflate until admission, but the
+  installments of one course stay fixed (the boss's explicit call, overriding
+  my earlier lean).
+- Retirement income and other cost-of-living series -> keep escalating.
+- Property of the GOAL, not the category -> it is asked, not derived: a
+  checkbox on recurring goals. Templates encode the policy: Child Education
+  arrives ticked, Retirement Income unticked.
+- An already-running EMI needs no special case: zero pre-start window means
+  flat at today's amount.
+
+**Default off is deliberate** - it is today's behaviour, so every saved plan
+replays identically (the parity golden masters double as the back-compat
+proof; no re-baseline). A CM forgetting to tick overfunds (conservative); the
+opposite default would let a forgotten untick underfund a retirement income
+silently (optimistic - the dangerous direction, per the goaldedupe lesson).
+
+**Divergence from the goal doc:** SS4.2 says every occurrence escalates to its
+own date. `goal_grid.py` stays doc-literal so Punit's worked tables keep
+reproducing; the flag lives in the engine only. Punit informed (the CRM goals
+contract gains the field; his ingestion should carry it alongside the goal
+IDs he mints).
+
+**Tests:** TestPaymentsFixedAtStart - flag-on flatness + exact first-payment
+amount, flag-off monotone growth, absent==off equality, end-to-end funding
+drop (>40% on the 20-year EMI), already-running EMI flat at today's amount.
+
+**Revisit when:** a client needs different growth rates before vs during the
+series (rent: CPI till start, contractual escalation after). That is a second
+rate field, not a flag - deliberately not built until asked for.
+
 ## 2026-08-25 - Wealth figures double-counted every rupee held for a goal
 
 **The bug:** the comprehensive view reports debt and hybrid TWICE by design -

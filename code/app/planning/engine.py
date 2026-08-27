@@ -43,9 +43,9 @@ from .grid_engine import (
 # v2 (2026-08-24): the goal GRID replaces glide-path chains and shared pools.
 # v1 lineage "1515f1e+pool2x2+lifetimefix+monthgrid+poolprefund+goaldedupe
 # +goaltaxequity" is retired; git history holds it. DECISIONS.md 2026-08-24.
-ENGINE_SOURCE_SHA = "v2grid+goaltaxequity"
+ENGINE_SOURCE_SHA = "v2grid+goaltaxequity+fixedstart"
 # Bump alongside ENGINE_SOURCE_SHA - shown in the app header as "updated ...".
-ENGINE_UPDATED = "2026-08-24"
+ENGINE_UPDATED = "2026-08-25"
 
 # Taxation of goal money ("+goaltaxequity", 2026-08-24, per advisory desk):
 # ALL goal buckets are equity-taxed - the "debt" bucket holds ARBITRAGE funds
@@ -386,13 +386,30 @@ def expand_recurring_goal_to_tranches(goal, current_date):
     if freq_months is None:
         return [(start, pv)]
     occurrences = int(goal.get('occurrences', 1) or 0)
+
+    # "+fixedstart" (DECISIONS.md 2026-08-25): contract-fixed payments. The
+    # amount escalates only until the FIRST payment - an EMI is signed, college
+    # fees lock at admission - so every occurrence equals the first. Without
+    # the flag each occurrence escalates to its own date (Punit doc SS4.2),
+    # which is right for cost-of-living series like retirement income but
+    # nearly doubles a 20-year EMI. Deliberate divergence from SS4.2, per
+    # operator decision; absent flag = old behaviour, so saved plans replay
+    # identically.
+    fixed = bool(goal.get('payments_fixed_at_start'))
+    if fixed:
+        years_to_start = max(0.0, (start - current_date).days / 365.25)
+        fixed_amount = pv * ((1 + inflation) ** years_to_start)
+
     tranches = []
     for k in range(occurrences):
         occ_date = start + relativedelta(months=k * freq_months)
         if pd.Timestamp(occ_date) > _MAX_SAFE_DATE:
             break
-        years_to = max(0.0, (occ_date - current_date).days / 365.25)
-        tranches.append((occ_date, pv * ((1 + inflation) ** years_to)))
+        if fixed:
+            tranches.append((occ_date, fixed_amount))
+        else:
+            years_to = max(0.0, (occ_date - current_date).days / 365.25)
+            tranches.append((occ_date, pv * ((1 + inflation) ** years_to)))
     return tranches
 
 

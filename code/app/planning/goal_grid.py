@@ -159,6 +159,12 @@ def invest_today_taxed(amount, t_years, negotiability, inflation,
 def expand_goal_to_cashflows(goal, plan_date=None):
     """Step 1 - a goal becomes its series of (date, amount) cashflows.
 
+    NOTE: this module is the DOC-LITERAL reference - per SS4.2 every occurrence
+    escalates to its own date. The live engine additionally supports
+    ``payments_fixed_at_start`` (EMIs, admission-locked fees escalate only to
+    the first payment; DECISIONS.md 2026-08-25) - a deliberate divergence that
+    is NOT mirrored here, so Punit's worked tables keep reproducing exactly.
+
     one-time -> a single cashflow; recurring -> ``occurrences`` cashflows stepped
     by the frequency's month step. ``relativedelta`` clamps month-ends (a goal on
     the 31st steps to the 30th, the 28th, and back).

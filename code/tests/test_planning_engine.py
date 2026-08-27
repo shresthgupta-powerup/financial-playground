@@ -145,7 +145,7 @@ def _parity_config_2():
 class TestParityGoldenMaster:
     def test_glidepath_version_pinned(self):
         assert GLIDEPATH_VERSION == 1
-        assert engine.ENGINE_SOURCE_SHA == "v2grid+goaltaxequity"
+        assert engine.ENGINE_SOURCE_SHA == "v2grid+goaltaxequity+fixedstart"
 
     def test_parity_config_1_retirement_date(self):
         res = find_retirement_date(_parity_config_1())
@@ -1486,3 +1486,62 @@ class TestComprehensiveViewIsNotDoubleCounted:
 
         naive = sum(row[c] for c in comp.columns if c.endswith("Value"))
         assert naive > total * 1.1        # the bug this test exists to catch
+
+
+class TestPaymentsFixedAtStart:
+    """"+fixedstart": contract-fixed payments escalate only to the FIRST one.
+
+    An EMI is signed, college fees lock at admission (operator decisions,
+    2026-08-25). Absent flag = per-occurrence escalation (Punit doc SS4.2), so
+    every saved plan replays identically - the parity golden masters double as
+    the back-compat proof.
+    """
+
+    def _emi(self, fixed):
+        return {"name": "Home Loan EMI", "type": "Non-Negotiable",
+                "structure": "Recurring", "start_date_mode": "Fixed",
+                "start_date": TODAY + pd.DateOffset(years=3),
+                "amount": 50_000, "frequency": "Monthly", "occurrences": 240,
+                "end_mode": "Occurrences", "inflation_percent": 6.0,
+                "payments_fixed_at_start": fixed}
+
+    def test_flag_on_all_payments_equal_the_first(self):
+        tr = expand_recurring_goal_to_tranches(self._emi(True), TODAY)
+        assert len(tr) == 240
+        amounts = {round(a, 6) for _d, a in tr}
+        assert len(amounts) == 1
+        # ... and the one amount is today's value escalated to the start date.
+        years = ((TODAY + pd.DateOffset(years=3)) - TODAY).days / 365.25
+        assert tr[0][1] == pytest.approx(50_000 * 1.06 ** years, rel=1e-12)
+
+    def test_flag_off_payments_keep_escalating(self):
+        tr = expand_recurring_goal_to_tranches(self._emi(False), TODAY)
+        amounts = [a for _d, a in tr]
+        assert all(b > a for a, b in zip(amounts, amounts[1:]))
+        assert amounts[-1] / amounts[0] == pytest.approx(
+            1.06 ** (239 / 12), rel=1e-3)
+
+    def test_absent_flag_is_identical_to_flag_off(self):
+        g = self._emi(False); del g["payments_fixed_at_start"]
+        assert expand_recurring_goal_to_tranches(g, TODAY) ==             expand_recurring_goal_to_tranches(self._emi(False), TODAY)
+
+    def test_fixed_emi_plan_funds_less(self):
+        """End-to-end: the same EMI goal costs materially less when fixed -
+        total goal payouts drop by the flat-vs-compounding gap (~47% here),
+        and feasibility can only improve."""
+        def run(fixed):
+            cfg = _grid_config([self._emi(fixed)], corpus=60_000_000)
+            ok, ft, _f, _pm, _gd, comp = run_simulation(
+                cfg, TODAY, _DEFAULT_INSTRUMENT_PARAMS)
+            return ok, comp["Replenishing Payouts"].sum()
+        ok_fixed, paid_fixed = run(True)
+        ok_grow, paid_grow = run(False)
+        assert ok_fixed is True
+        assert paid_fixed < paid_grow * 0.60
+        assert ok_grow in (True, False)  # growing may or may not clear 6 Cr
+
+    def test_already_running_emi_is_flat_at_todays_amount(self):
+        g = self._emi(True); g["start_date"] = TODAY
+        tr = expand_recurring_goal_to_tranches(g, TODAY)
+        assert tr[0][1] == pytest.approx(50_000)
+        assert tr[-1][1] == pytest.approx(50_000)

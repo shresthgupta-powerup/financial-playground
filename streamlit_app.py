@@ -142,6 +142,10 @@ def make_default_goal(index: int, today: pd.Timestamp) -> dict:
         "occurrences": 1,
         "end_date": None,
         "inflation_percent": 6.0,
+        # Contract-fixed payments (EMI, admission-locked fees): escalate only
+        # until the first payment, then flat. Off = escalate every payment to
+        # its own date (cost-of-living series like retirement income).
+        "payments_fixed_at_start": False,
     }
 
 
@@ -154,6 +158,7 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
             start_date_mode="At retirement", start_date=add_years(today, 30),
             amount=75_000, frequency="Monthly", end_mode="Lifetime",
             occurrences=360, end_date=None, inflation_percent=6.0,
+            payments_fixed_at_start=False,  # income must track cost of living
         )
     elif template_key == "child_education":
         base.update(
@@ -162,6 +167,9 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
             start_date_mode="Fixed", start_date=add_years(today, 12),
             amount=1_500_000, frequency="Annual", end_mode="Occurrences",
             occurrences=4, inflation_percent=8.0,
+            # Fees lock at admission - the 4 installments stay fixed
+            # (operator decision, 2026-08-25).
+            payments_fixed_at_start=True,
         )
     elif template_key == "marriage":
         base.update(
@@ -440,6 +448,8 @@ def _crm_goal(g: dict, resolved: bool, current_date=None) -> dict:
             goal["end_mode"] = g.get("end_mode")
             goal["end_date"] = _iso_or_none(g.get("end_date"))
     goal["inflation_percent"] = g.get("inflation_percent")
+    if recurring:
+        goal["payments_fixed_at_start"] = bool(g.get("payments_fixed_at_start"))
     return goal
 
 
@@ -622,6 +632,7 @@ def form_state_from_inputs(doc: dict):
             "end_mode": end_mode,
             "end_date": ts(g.get("end_date")),
             "inflation_percent": num(g.get("inflation_percent"), 6.0),
+            "payments_fixed_at_start": bool(g.get("payments_fixed_at_start")),
         }))
 
     # Saved plans from before the duplicate-name fix can carry two goals with
@@ -1238,6 +1249,16 @@ def render_goal(g: dict) -> None:
             index=GOAL_END_MODES.index(g["end_mode"] if g["end_mode"] in GOAL_END_MODES else "Occurrences"),
             key=f"g_endmode_{uid}",
         )
+        g["payments_fixed_at_start"] = st.checkbox(
+            "Payments fixed once the goal starts (EMI, college fees)",
+            value=bool(g.get("payments_fixed_at_start")),
+            key=f"g_fixedstart_{uid}",
+            help="Ticked: the amount grows at the growth % only until the first "
+                 "payment, then every payment stays at that amount - an EMI is "
+                 "signed, fees lock at admission. Unticked: every payment keeps "
+                 "growing to its own date - right for cost-of-living series "
+                 "like retirement income.",
+        )
         if g["end_mode"] == "Occurrences":
             g["occurrences"] = r5c3.number_input(
                 "Number of payments", min_value=1, value=int(g["occurrences"] or 1),
@@ -1292,6 +1313,7 @@ def build_config(personal: dict) -> dict:
             "end_mode": g["end_mode"],
             "end_date": g["end_date"],
             "inflation_percent": float(g["inflation_percent"]),
+            "payments_fixed_at_start": bool(g.get("payments_fixed_at_start")),
         })
     one_time = [
         {"name": w["name"], "date": w["date"], "amount": float(w["amount"])}
