@@ -6,6 +6,46 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-30 - CRM goals contract: flat rows, strict tokens, `purpose_id`
+
+**What changed:** new export `crm_goals_upload_json()` producing the CRM's
+goals upload file to Punit's spec (email 2026-08-30): strictly
+`{"goals": [...]}`, eleven keys on every goal, their vocabulary, dates
+resolved. Goals gained two fields - `purpose_id` (CRM-minted identity, null
+until first upload) and `goal_category` (their ten-value taxonomy, a picker
+on the goal card). The loader now also accepts their FLAT goal rows, which is
+how minted ids come back to us. Our own inputs JSON is unchanged - it is our
+save format, not theirs.
+
+**Their contract, in their words:** nothing is interpreted on their side - a
+missing key, an unknown key, a null where one is not allowed, or a token in
+the wrong case rejects that goal. So `test_crm_contract.py` pins the file key
+by key and token by token; a drift is a silent rejection for a CM.
+
+**Two judgement calls, both flagged back to Punit:**
+
+1. `occurrences: 500` is their marker for "open-ended (lifetime /
+   at-retirement)". We apply it ONLY to a series whose length is genuinely
+   unstated (our Lifetime end mode). A series that merely starts at
+   retirement but runs a stated 240 payments keeps 240 - writing 500 would
+   misstate a real number, and its start date is resolved regardless.
+2. That 500 is load-bearing in the OTHER direction. Their contract drops
+   `end_mode` and `start_date_mode` - exactly what `payments_fixed_for()`
+   reads - so after a CRM round trip the only surviving signal that a goal is
+   income is `occurrences == 500`. The loader maps it back to Lifetime, which
+   restores the policy; without it a retirement income would silently stop
+   escalating. Safe in practice (500 monthly = 41 years, past any real EMI)
+   but it means a genuine 500-payment fixed series would be misread. Noted to
+   Punit; the clean fix if it ever bites is a flag they store.
+
+**Not sent:** `payments_fixed_at_start` (stays derived our side, per their
+note), and `nature` / `structure` / `end_mode` / `start_date_mode` (no longer
+accepted).
+
+**Operational note:** the upload file requires a solved retirement date, so
+it is offered only on a successful run - "at retirement" has no
+representation in their contract.
+
 ## 2026-08-27 - Fixed-vs-inflating payments is POLICY, not a CM choice
 
 **What changed:** the `payments_fixed_at_start` checkbox (shipped 2026-08-25,

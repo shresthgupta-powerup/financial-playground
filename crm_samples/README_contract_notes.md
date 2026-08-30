@@ -1,75 +1,58 @@
-# Inputs JSON — contract samples for CRM ingestion
+# CRM goals contract — samples and notes
 
-Two files, **one identical plan**, exported through the playground's real
-download code (engine `v2grid+goaltaxequity+fixedstart`):
+Built to Punit's flat-structure spec (2026-08-30). Engine
+`v2grid+goaltaxequity+fixedstart`.
 
 | File | What it is |
 |---|---|
-| `sample_inputs_A_as_entered.json` | The plan exactly as the CM entered it. This is what the version log stores and what "Inputs (JSON)" downloads before a run. |
-| `sample_inputs_B_resolved_after_run.json` | The same plan after a successful solve (earliest retirement Sep 2031). Open-ended series are resolved to concrete numbers — this file matches the simulation exactly. |
+| `sample_crm_goals_upload.json` | **The upload file.** Exactly the contract: `{"goals": [...]}`, eleven keys per goal, CRM vocabulary, dates resolved. This is what the playground's "CRM goals upload" button produces. |
+| `sample_inputs_A_as_entered.json` | Our own record of the same plan, as the CM entered it. Reloads into the form; not for CRM ingestion. |
+| `sample_inputs_B_resolved_after_run.json` | The same, after the solve. Shown so you can see what our resolution does. |
 
-Diff the two to see exactly what resolution does; everything else is
-byte-identical.
+The eight goals cover every shape a CM can build: all three
+negotiabilities, one-off goals, a fixed-count series, a fixed-end-date
+series, a lifetime income starting at retirement, a signed 0%-growth EMI,
+and a duplicate goal name (numbered "Child Education 2" by us).
 
-## What resolution changes (A → B)
+## How each contract field is produced
 
-- **"At retirement" start** → a concrete `start_date` (the solved retirement
-  month) and `start_date_mode` becomes `Fixed`.
-- **`end_mode: "Lifetime"`** → a concrete `occurrences` count (to the plan's
-  lifetime end) and a concrete `end_date`.
-- **`end_mode: "Fixed date"`** → the implied `occurrences` count is filled in
-  (start → end at the frequency's step, inclusive).
+| Field | Source |
+|---|---|
+| `purpose_id` | `null` for a goal never uploaded. Once the CRM mints one, it is stored on the goal and re-sent on every later upload. Loading a CRM goals file back into the playground is how the ids arrive. |
+| `goal_name` | Unique per plan, case-insensitively — we number duplicates ourselves. |
+| `goal_type` | Chosen by the CM from your ten categories; `null` when not set. |
+| `goal_negotiability` | `non_negotiable` / `semi_negotiable` / `negotiable`. |
+| `goal_description` | Always a string, `""` when blank — never null. |
+| `amount_per_occurrence` | Whole rupees, today's money, one payment (not the series total). |
+| `occurrences` | Real count; `1` for a one-off. **500** for a lifetime series (see below). |
+| `frequency` | `null` exactly when `occurrences == 1`, else `monthly` / `quarterly` / `half_yearly` / `yearly`. We have no `every_other_year` input. |
+| `start_date` | `YYYY-MM-01`, always concrete — "at retirement" is resolved against the solved date, so **the upload file only exists for a plan that has been run successfully**. |
+| `inflation` | Fraction (8% → `0.08`). |
+| `goal_status` | Always `active` — the playground has no notion of a goal being achieved or cancelled. |
 
-## The goals in the sample, and what each demonstrates
+## Two things worth confirming
 
-| Goal | Shape | Demonstrates |
-|---|---|---|
-| Home Purchase Down Payment | Lumpsum, Non-negotiable, 4y out | Single cashflow; no recurring fields in the JSON |
-| Marriage | Lumpsum, Semi-negotiable, 12y out | `nature: Replenishing` on a one-time goal — see §4.5 note below |
-| World Trip | Lumpsum, Negotiable | Third negotiability value |
-| Child Education | Recurring, Annual ×4 | `payments_fixed_at_start: true` — fees lock at admission |
-| Home Loan EMI | Recurring, Monthly ×180, 0% growth | A signed EMI: flat at today's amount for its whole life |
-| Parents Support | Recurring, Quarterly, Fixed-date end | `end_date` instead of `occurrences`; count filled in file B |
-| Retirement Income | Recurring, starts At retirement, Lifetime | The one INCOME goal: `payments_fixed_at_start: false` |
-| Child Education 2 | Duplicate name | The app numbers duplicates so both goals fund (never silently merged) |
+**1. `occurrences: 500` — we read it as "lifetime", and only that.** Your
+spec says to write 500 for "open-ended (lifetime / at-retirement)". We apply
+it only to a series whose length genuinely is not stated (our Lifetime end
+mode). A series that merely *starts* at retirement but runs a stated 240
+payments keeps 240 — writing 500 there would misstate a real number, and its
+start date is resolved anyway. Shout if you meant 500 for both.
 
-## Field notes
+**2. 500 is load-bearing on the way back.** The contract drops `end_mode` and
+`start_date_mode`, which is exactly what our fixed-vs-inflating rule reads:
+every recurring goal is contract-fixed (amount escalates only to the FIRST
+payment, then flat — EMIs are signed, fees lock at admission) **except**
+income-like series, which keep escalating. After a round trip the only
+surviving signal that a goal is income is `occurrences == 500`, so that is
+what we key on. It holds in practice (500 monthly payments is 41 years, well
+past any real EMI), but it does mean a genuine 500-payment fixed series would
+be misread as income. If that ever matters, the cleanest fix is a flag you
+store; for now nothing in our corpus comes close.
 
-**`payments_fixed_at_start`** (recurring goals only) — **derived by policy,
-not chosen by the CM**: every recurring goal is contract-fixed (the amount
-escalates at `inflation_percent` only until the FIRST payment, then every
-payment stays at that amount) EXCEPT income-like series, which keep
-escalating throughout. "Income" is structural: the goal starts At retirement,
-or its payments run for Lifetime. Please persist this field with the goal —
-a plan re-imported later must keep the same treatment. This deliberately
-diverges from §4.2's per-occurrence escalation for the contract-fixed cases;
-your worked tables still reproduce against our doc-literal reference module.
+## Not sent, deliberately
 
-**`nature`** — derived per §4.5, never typed: "Replenishing" means *the goal
-has cashflows beyond the carve window today* (5/4/3 years by negotiability),
-i.e. a later plan carries it forward. Read it as a statement about the window,
-not about the goal being endless — a one-time Marriage 12 years out is
-correctly "Replenishing" in this vocabulary, and becomes "Non-replenishing"
-by itself once it drifts inside the window. If you derive nature on your side,
-derive it from the cashflow series + the grid's reach; do not key logic off
-our exported value being stable over time.
-
-**`amount`** — today's rupees, **per payment** for recurring goals (one
-installment, not the series total). Escalation to actual payment dates is the
-engine's job per the rules above.
-
-**Dates** — always `YYYY-MM-01`: the engine snaps everything to a day-1 month
-grid.
-
-**`type`** — negotiability: `Non-negotiable` / `Semi-negotiable` /
-`Negotiable` (CRM casing).
-
-**Goal IDs** — none in this export by agreement: you mint IDs at ingestion.
-Names are unique within a plan (duplicates arrive numbered).
-
-**Top-level** — `engine_version` stamps which model produced the file;
-`simulation_id` ties it to the run log; `retirement_mode` / `target_date` /
-`target_age` describe the solve mode (`earliest` here, so targets are null).
-`personal`, `investment_streams`, `one_time_investments` are a faithful record
-of the form; the CRM contract only requires `goals` + `personal.client_name`
-+ `generated_at`.
+`payments_fixed_at_start` stays derived on our side per your note.
+`nature`, `structure`, `end_mode`, `start_date_mode` are gone from the upload
+file. Our own inputs JSON still carries them — it is our save format, not
+yours, and the CRM never sees it.

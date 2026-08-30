@@ -48,6 +48,24 @@ from app.planning.schemas import RISK_PROFILE_CORE_RETURNS
 
 # ── Picklists (mirror planForm.js) ──────────────────────────────────────────
 GOAL_TYPES = ["Non-Negotiable", "Semi-Negotiable", "Negotiable"]
+
+# CRM goals contract (Punit, 2026-08-30). The CRM stores one FLAT row per
+# goal; tokens are exact and case-sensitive - anything else rejects the goal.
+CRM_GOAL_CATEGORIES = [
+    None, "education", "marriage", "home", "vehicle", "travel",
+    "retirement", "healthcare", "emergency", "business", "other",
+]
+CRM_NEGOTIABILITY = {
+    "Non-Negotiable": "non_negotiable",
+    "Semi-Negotiable": "semi_negotiable",
+    "Negotiable": "negotiable",
+}
+CRM_FREQUENCY = {
+    "Monthly": "monthly", "Quarterly": "quarterly",
+    "Half-Yearly": "half_yearly", "Annual": "yearly",
+}
+# Their marker for a series whose length we cannot state (our Lifetime goals).
+CRM_OPEN_ENDED_OCCURRENCES = 500
 GOAL_NATURES = ["Non-replenishing", "Replenishing"]
 
 # v2 (2026-08-24): "nature" is no longer asked. A goal's purpose is DERIVED —
@@ -143,6 +161,10 @@ def make_default_goal(index: int, today: pd.Timestamp) -> dict:
         "occurrences": 1,
         "end_date": None,
         "inflation_percent": 6.0,
+        # CRM contract fields. purpose_id is minted by the CRM (None until a
+        # goal has been uploaded once) and must ride back on every re-export.
+        "purpose_id": None,
+        "goal_category": None,
     }
 
 
@@ -155,6 +177,7 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
             start_date_mode="At retirement", start_date=add_years(today, 30),
             amount=75_000, frequency="Monthly", end_mode="Lifetime",
             occurrences=360, end_date=None, inflation_percent=6.0,
+            goal_category="retirement",
         )
     elif template_key == "child_education":
         base.update(
@@ -162,21 +185,21 @@ def make_goal_from_template(template_key: str, index: int, today: pd.Timestamp) 
             nature="Non-replenishing", structure="Recurring", type="Non-Negotiable",
             start_date_mode="Fixed", start_date=add_years(today, 12),
             amount=1_500_000, frequency="Annual", end_mode="Occurrences",
-            occurrences=4, inflation_percent=8.0,
+            occurrences=4, inflation_percent=8.0, goal_category="education",
         )
     elif template_key == "marriage":
         base.update(
             name="Marriage", description="Wedding expenses",
             nature="Non-replenishing", structure="Lumpsum", type="Semi-Negotiable",
             start_date_mode="Fixed", start_date=add_years(today, 20),
-            amount=3_000_000, inflation_percent=7.0,
+            amount=3_000_000, inflation_percent=7.0, goal_category="marriage",
         )
     elif template_key == "home_purchase":
         base.update(
             name="Home Purchase", description="Down payment / purchase",
             nature="Non-replenishing", structure="Lumpsum", type="Negotiable",
             start_date_mode="Fixed", start_date=add_years(today, 8),
-            amount=5_000_000, inflation_percent=6.0,
+            amount=5_000_000, inflation_percent=6.0, goal_category="home",
         )
     return base
 
@@ -476,6 +499,95 @@ def _crm_goal(g: dict, resolved: bool, current_date=None) -> dict:
     return goal
 
 
+def crm_goals_upload_json(config: dict, retirement_date) -> bytes:
+    """The CRM's goals upload file (Punit's spec, 2026-08-30).
+
+    Strictly ``{"goals": [...]}`` - no envelope - and every goal carries
+    exactly the eleven contract keys, always present. Nothing is interpreted
+    on their side: a missing key, an unknown key, a null where one is not
+    allowed, or a token in the wrong case rejects that goal.
+
+    Requires a solved retirement_date: the contract has no "at retirement"
+    concept, so those starts must already be concrete dates.
+    """
+    current_date = pd.Timestamp(config["current_date"])
+    death_date = current_date + pd.DateOffset(
+        years=int(float(config.get("target_lifetime", 90))
+                  - float(config.get("current_age", 30))))
+    resolved = _resolve_goals(config.get("goals", []) or [],
+                              pd.Timestamp(retirement_date), death_date)
+
+    goals = []
+    for entered, g in zip(config.get("goals", []) or [], resolved):
+        recurring = g.get("structure") == "Recurring"
+        # Their marker for an unbounded series: our Lifetime end mode. A goal
+        # with a real count keeps it, even when it starts at retirement.
+        open_ended = recurring and entered.get("end_mode") == "Lifetime"
+        if open_ended:
+            occurrences = CRM_OPEN_ENDED_OCCURRENCES
+        elif recurring:
+            occurrences = max(1, int(g.get("occurrences") or 1))
+        else:
+            occurrences = 1
+        goals.append({
+            "purpose_id": g.get("purpose_id") or None,
+            "goal_name": g.get("name"),
+            "goal_type": g.get("goal_category") or None,
+            "goal_negotiability": CRM_NEGOTIABILITY.get(g.get("type")),
+            "goal_description": g.get("description") or "",
+            "amount_per_occurrence": int(round(float(g.get("amount") or 0))),
+            "occurrences": occurrences,
+            "frequency": (CRM_FREQUENCY.get(g.get("frequency"))
+                          if occurrences > 1 else None),
+            "start_date": pd.Timestamp(g["start_date"]).strftime("%Y-%m-01"),
+            "inflation": round(float(g.get("inflation_percent") or 0) / 100.0, 6),
+            "goal_status": "active",
+        })
+    return json.dumps({"goals": goals}, indent=2).encode("utf-8")
+
+
+_CRM_NEGOTIABILITY_BACK = {v: k for k, v in CRM_NEGOTIABILITY.items()}
+_CRM_FREQUENCY_BACK = {v: k for k, v in CRM_FREQUENCY.items()}
+
+
+def _goal_from_crm_row(row: dict) -> dict:
+    """One flat CRM goal row -> our goal shape (their spec, 2026-08-30).
+
+    ``occurrences == CRM_OPEN_ENDED_OCCURRENCES`` is their marker for a series
+    whose length is not stated, which is our Lifetime end mode. Restoring it
+    matters: it is what makes ``payments_fixed_for`` classify the goal as
+    income again, so a retirement income keeps escalating after a round trip
+    through the CRM. Everything else lands as a plain fixed-count series.
+    """
+    occ = int(row.get("occurrences") or 1)
+    open_ended = occ == CRM_OPEN_ENDED_OCCURRENCES
+    recurring = occ > 1
+    return {
+        "name": row.get("goal_name"),
+        "description": row.get("goal_description") or "",
+        "type": _CRM_NEGOTIABILITY_BACK.get(row.get("goal_negotiability")),
+        "structure": "Recurring" if recurring else "Lumpsum",
+        "start_date_mode": "Fixed",
+        "start_date": row.get("start_date"),
+        "amount": row.get("amount_per_occurrence"),
+        "frequency": _CRM_FREQUENCY_BACK.get(row.get("frequency")),
+        "occurrences": occ,
+        "end_mode": ("Lifetime" if open_ended
+                     else ("Occurrences" if recurring else None)),
+        "end_date": None,
+        "inflation_percent": (float(row["inflation"]) * 100.0
+                              if row.get("inflation") is not None else None),
+        "purpose_id": row.get("purpose_id") or None,
+        "goal_category": row.get("goal_type") or None,
+    }
+
+
+def crm_upload_filename(config: dict) -> str:
+    raw = (config.get("client_name") or "plan").strip() or "plan"
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", raw).strip("-") or "plan"
+    return f"crm_goals_upload_{slug}_{pd.Timestamp.now().strftime('%Y-%m-%d_%H%M')}.json"
+
+
 def build_inputs_json(config: dict, retirement_date=None) -> bytes:
     """Serialise the user's inputs as pretty JSON bytes; goals are CRM-ready.
 
@@ -564,9 +676,18 @@ def form_state_from_inputs(doc: dict):
     Returns (personal, streams, goals, one_time); raises ValueError on files
     that aren't an inputs JSON.
     """
-    if not isinstance(doc, dict) or "personal" not in doc or "goals" not in doc:
-        raise ValueError("not an inputs JSON (missing 'personal'/'goals')")
+    if not isinstance(doc, dict) or "goals" not in doc:
+        raise ValueError("not an inputs JSON (missing 'goals')")
     today = month_start_today()
+    # A CRM goals file is flat rows with no envelope. Translate it into our
+    # shape first so the rest of this function is unchanged - this is how
+    # CRM-minted purpose_ids come back to us (their spec, 2026-08-30).
+    if doc.get("goals") and isinstance(doc["goals"][0], dict)             and "goal_name" in doc["goals"][0]:
+        doc = dict(doc)
+        doc.setdefault("personal", {})
+        doc["goals"] = [_goal_from_crm_row(r) for r in doc["goals"]]
+    if "personal" not in doc:
+        raise ValueError("not an inputs JSON (missing 'personal')")
 
     def ts(v, fallback=None):
         if not v:
@@ -655,6 +776,8 @@ def form_state_from_inputs(doc: dict):
             "end_mode": end_mode,
             "end_date": ts(g.get("end_date")),
             "inflation_percent": num(g.get("inflation_percent"), 6.0),
+            "purpose_id": g.get("purpose_id") or None,
+            "goal_category": g.get("goal_category") or None,
         }))
 
     # Saved plans from before the duplicate-name fix can carry two goals with
@@ -1259,6 +1382,18 @@ def render_goal(g: dict) -> None:
         value=float(g["inflation_percent"]), step=0.5, key=f"g_infl_{uid}",
     )
 
+    _cats = CRM_GOAL_CATEGORIES
+    _cur = g.get("goal_category") if g.get("goal_category") in _cats else None
+    g["goal_category"] = st.selectbox(
+        "Category (for the CRM)", _cats, index=_cats.index(_cur),
+        format_func=lambda v: "— not set —" if v is None else v.title(),
+        key=f"g_cat_{uid}",
+        help="The CRM's own goal taxonomy. Optional, but it is what their "
+             "reporting groups goals by.",
+    )
+    if g.get("purpose_id"):
+        st.caption(f"CRM id: `{g['purpose_id']}`")
+
     if g["structure"] == "Recurring":
         r5c1, r5c2, r5c3 = st.columns(3)
         g["frequency"] = r5c1.selectbox(
@@ -1342,6 +1477,8 @@ def build_config(personal: dict) -> dict:
             "end_date": g["end_date"],
             "inflation_percent": float(g["inflation_percent"]),
             "payments_fixed_at_start": payments_fixed_for(g),
+            "purpose_id": g.get("purpose_id") or None,
+            "goal_category": g.get("goal_category") or None,
         })
     one_time = [
         {"name": w["name"], "date": w["date"], "amount": float(w["amount"])}
@@ -1815,7 +1952,15 @@ def render_results(out: dict) -> None:
     st.dataframe(out["goal_table"], use_container_width=True, hide_index=True)
 
     st.subheader("Downloads")
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
+    d4.download_button(
+        "🔗 CRM goals upload (JSON)",
+        data=crm_goals_upload_json(out["config"], out["retirement_date"]),
+        file_name=crm_upload_filename(out["config"]), mime="application/json",
+        key="dl_crm_upload",
+        help="The CRM's strict goals file: flat rows, resolved dates, their "
+             "vocabulary. Upload this straight into the CRM.",
+    )
     d1.download_button(
         "📗 Advisor workbook (Excel)", data=out["workbook"],
         file_name="financial_plan_advisor.xlsx",
@@ -1831,8 +1976,11 @@ def render_results(out: dict) -> None:
         key="dl_inputs_success",
     )
     st.caption(
-        "The JSON's goals carry concrete dates from this run — 'At retirement' "
-        "becomes the solved date, Lifetime becomes a payment count — ready for CRM import."
+        "**Inputs (JSON)** is our own record — it reloads into this form. "
+        "**CRM goals upload** is the CRM's strict contract: flat rows in their "
+        "vocabulary, 'At retirement' resolved to the solved date, and a "
+        f"lifetime series written as {CRM_OPEN_ENDED_OCCURRENCES} payments. "
+        "Load a CRM goals file back here to pick up the ids they mint."
     )
 
 
