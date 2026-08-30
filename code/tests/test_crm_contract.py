@@ -209,3 +209,33 @@ class TestShippedSampleMatchesTheContract:
             assert g["goal_status"] == "active"
         names = [g["goal_name"].lower() for g in doc["goals"]]
         assert len(names) == len(set(names)), "goal_name unique per plan"
+
+
+class TestWeRefuseWhatWeCannotRepresent:
+    def test_every_other_year_is_rejected_not_silently_monthlyfied(self):
+        """Their enum has every_other_year; our engine has no 24-month step.
+        Falling through would hit normalise_goal's "Monthly" default and
+        over-fund the goal twelvefold, so the loader must refuse instead.
+        """
+        row = {
+            "purpose_id": None, "goal_name": "Biennial", "goal_type": "other",
+            "goal_negotiability": "negotiable", "goal_description": "",
+            "amount_per_occurrence": 100_000, "occurrences": 10,
+            "frequency": "every_other_year", "start_date": "2030-01-01",
+            "inflation": 0.06, "goal_status": "active",
+        }
+        with pytest.raises(ValueError, match="every_other_year"):
+            sa.form_state_from_inputs({"goals": [row]})
+
+    def test_the_frequencies_we_do_support_still_load(self):
+        for token in ("monthly", "quarterly", "half_yearly", "yearly"):
+            row = {
+                "purpose_id": None, "goal_name": "G", "goal_type": None,
+                "goal_negotiability": "negotiable", "goal_description": "",
+                "amount_per_occurrence": 1000, "occurrences": 5,
+                "frequency": token, "start_date": "2030-01-01",
+                "inflation": 0.06, "goal_status": "active",
+            }
+            _p, _s, goals, _o = sa.form_state_from_inputs({"goals": [row]})
+            assert goals[0]["frequency"] in ("Monthly", "Quarterly",
+                                             "Half-Yearly", "Annual")

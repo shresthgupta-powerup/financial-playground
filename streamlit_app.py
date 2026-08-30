@@ -562,6 +562,17 @@ def _goal_from_crm_row(row: dict) -> dict:
     occ = int(row.get("occurrences") or 1)
     open_ended = occ == CRM_OPEN_ENDED_OCCURRENCES
     recurring = occ > 1
+    freq_token = row.get("frequency")
+    if recurring and freq_token not in _CRM_FREQUENCY_BACK:
+        # Their enum has every_other_year; our engine's frequency table has no
+        # 24-month step, so there is nothing to map it to. Refuse loudly - the
+        # silent alternative (falling through to the "Monthly" default in
+        # normalise_goal) would turn a biennial goal into a monthly one and
+        # over-fund it twelvefold.
+        raise ValueError(
+            f"goal {row.get('goal_name')!r}: frequency {freq_token!r} has no "
+            "equivalent in the planner (we support monthly / quarterly / "
+            "half_yearly / yearly)")
     return {
         "name": row.get("goal_name"),
         "description": row.get("goal_description") or "",
@@ -570,7 +581,7 @@ def _goal_from_crm_row(row: dict) -> dict:
         "start_date_mode": "Fixed",
         "start_date": row.get("start_date"),
         "amount": row.get("amount_per_occurrence"),
-        "frequency": _CRM_FREQUENCY_BACK.get(row.get("frequency")),
+        "frequency": _CRM_FREQUENCY_BACK.get(freq_token),
         "occurrences": occ,
         "end_mode": ("Lifetime" if open_ended
                      else ("Occurrences" if recurring else None)),
