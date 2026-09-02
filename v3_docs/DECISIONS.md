@@ -6,6 +6,55 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-08-31 - CRM goals contract v2, and the income flag it rescued
+
+**What changed:** Punit's v2 spec, built and shipped the same day.
+
+- `purpose_id` REMOVED. The upload is strictly ADD - the CM appends goals to
+  the client's CRM list, which is the source of truth for edits and
+  cancellations - so nothing in the file addresses an existing goal and an id
+  has no job. Dropped from the export, the loader, the form state and the
+  goal card.
+- `lifetime` ADDED (boolean, null when `occurrences == 1`).
+- `payments_fixed_at_start` ADDED (boolean, null when `occurrences == 1`).
+  They store and return it verbatim; we re-derive from live policy on load, so
+  a stale row cannot override the current rule.
+- `occurrences` now always the TRUE simulated count. The `CRM_OPEN_ENDED_
+  OCCURRENCES = 500` sentinel is retired.
+- `every_other_year` gone from their enum too. Our loader still refuses any
+  frequency it cannot represent - defensive, since the silent alternative is
+  `normalise_goal`'s "Monthly" default over-funding a goal.
+
+**Why the sentinel had to go - Punit's catch:** v1 inferred "unbounded" from
+`occurrences == 500`. On a real plan (Aman Gupta) the income resolved to 397
+occurrences, missed the sentinel, and would have been read back as
+contract-fixed - silently stopping that client's retirement income from
+tracking inflation. The magic number was deciding a forty-year funding
+question.
+
+**The bug his catch exposed on OUR side (worse, and live):** the same loss
+existed in our own save format, independent of the CRM.
+`build_inputs_json(retirement_date=...)` resolves Lifetime into a concrete
+count and "At retirement" into a date - erasing BOTH signals
+`payments_fixed_for` reads. Reloading a resolved export therefore turned a
+retirement income into a contract-fixed series that stopped escalating.
+Reproduced end to end before fixing. Reachable via the resolved download, not
+via version history (which stores the as-entered shape). Our inputs JSON now
+carries `lifetime` explicitly and the loader restores the end mode from it;
+both round trips are pinned by tests.
+
+**Punit's other decisions, accepted as his call:** no client envelope in the
+file (wrong-file risk handled by CM process on their side); no
+`source_simulation_id`.
+
+**Operational note worth watching:** ADD-only plus no ids means a re-upload
+after editing a plan APPENDS a second copy of every goal rather than updating
+the first. Flagged to Punit; their UI is where edits are meant to happen.
+
+**Tests:** `test_crm_contract.py` (19) pins the twelve keys in order, the
+null rules, both booleans, the true-count guarantee, both round trips, and
+the frequency refusal.
+
 ## 2026-08-30 - CRM goals contract: flat rows, strict tokens, `purpose_id`
 
 **What changed:** new export `crm_goals_upload_json()` producing the CRM's

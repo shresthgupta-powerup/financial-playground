@@ -65,7 +65,10 @@ CRM_FREQUENCY = {
     "Half-Yearly": "half_yearly", "Annual": "yearly",
 }
 # Their marker for a series whose length we cannot state (our Lifetime goals).
-CRM_OPEN_ENDED_OCCURRENCES = 500
+# Contract v2 (2026-08-31): `lifetime` is its own boolean and `occurrences`
+# always carries the true simulated count. The old 500 sentinel is retired -
+# Punit caught it failing on a real plan (Aman Gupta's income exported 397,
+# so a 500-keyed rule would have read his income as contract-fixed).
 GOAL_NATURES = ["Non-replenishing", "Replenishing"]
 
 # v2 (2026-08-24): "nature" is no longer asked. A goal's purpose is DERIVED —
@@ -161,9 +164,8 @@ def make_default_goal(index: int, today: pd.Timestamp) -> dict:
         "occurrences": 1,
         "end_date": None,
         "inflation_percent": 6.0,
-        # CRM contract fields. purpose_id is minted by the CRM (None until a
-        # goal has been uploaded once) and must ride back on every re-export.
-        "purpose_id": None,
+        # CRM contract field. purpose_id is gone in v2: the upload is
+        # strictly ADD, so nothing in the file addresses an existing goal.
         "goal_category": None,
     }
 
@@ -496,6 +498,11 @@ def _crm_goal(g: dict, resolved: bool, current_date=None) -> dict:
     goal["inflation_percent"] = g.get("inflation_percent")
     if recurring:
         goal["payments_fixed_at_start"] = bool(g.get("payments_fixed_at_start"))
+        # Resolution replaces Lifetime with a concrete count, which used to
+        # lose the fact that the series was unbounded - and with it the income
+        # classification, so a reloaded resolved file silently stopped
+        # escalating a retirement income. Carry it explicitly.
+        goal["lifetime"] = g.get("end_mode") == "Lifetime"
     return goal
 
 
@@ -520,25 +527,22 @@ def crm_goals_upload_json(config: dict, retirement_date) -> bytes:
     goals = []
     for entered, g in zip(config.get("goals", []) or [], resolved):
         recurring = g.get("structure") == "Recurring"
-        # Their marker for an unbounded series: our Lifetime end mode. A goal
-        # with a real count keeps it, even when it starts at retirement.
-        open_ended = recurring and entered.get("end_mode") == "Lifetime"
-        if open_ended:
-            occurrences = CRM_OPEN_ENDED_OCCURRENCES
-        elif recurring:
-            occurrences = max(1, int(g.get("occurrences") or 1))
-        else:
-            occurrences = 1
+        # v2: occurrences is always the true count the simulation used, and
+        # "unbounded" is carried by its own boolean instead of a magic number.
+        occurrences = max(1, int(g.get("occurrences") or 1)) if recurring else 1
+        many = occurrences > 1
         goals.append({
-            "purpose_id": g.get("purpose_id") or None,
             "goal_name": g.get("name"),
             "goal_type": g.get("goal_category") or None,
             "goal_negotiability": CRM_NEGOTIABILITY.get(g.get("type")),
             "goal_description": g.get("description") or "",
             "amount_per_occurrence": int(round(float(g.get("amount") or 0))),
             "occurrences": occurrences,
+            "lifetime": (entered.get("end_mode") == "Lifetime") if many else None,
+            # Our policy value, sent verbatim: they store and return it.
+            "payments_fixed_at_start": payments_fixed_for(entered) if many else None,
             "frequency": (CRM_FREQUENCY.get(g.get("frequency"))
-                          if occurrences > 1 else None),
+                          if many else None),
             "start_date": pd.Timestamp(g["start_date"]).strftime("%Y-%m-01"),
             "inflation": round(float(g.get("inflation_percent") or 0) / 100.0, 6),
             "goal_status": "active",
@@ -551,24 +555,22 @@ _CRM_FREQUENCY_BACK = {v: k for k, v in CRM_FREQUENCY.items()}
 
 
 def _goal_from_crm_row(row: dict) -> dict:
-    """One flat CRM goal row -> our goal shape (their spec, 2026-08-30).
+    """One flat CRM goal row -> our goal shape (contract v2, 2026-08-31).
 
-    ``occurrences == CRM_OPEN_ENDED_OCCURRENCES`` is their marker for a series
-    whose length is not stated, which is our Lifetime end mode. Restoring it
-    matters: it is what makes ``payments_fixed_for`` classify the goal as
-    income again, so a retirement income keeps escalating after a round trip
-    through the CRM. Everything else lands as a plain fixed-count series.
+    v2 carries `lifetime` and `payments_fixed_at_start` as their own booleans,
+    so nothing has to be inferred from the occurrence count. Restoring
+    `lifetime` is what keeps a retirement income classified as income - and
+    therefore still escalating - after a round trip. `payments_fixed_at_start`
+    is stored and returned verbatim by the CRM; we re-derive it from policy
+    on load rather than trusting it back, so a stale row cannot override the
+    current rule, but we assert the two agree so a drift is visible.
     """
     occ = int(row.get("occurrences") or 1)
-    open_ended = occ == CRM_OPEN_ENDED_OCCURRENCES
     recurring = occ > 1
     freq_token = row.get("frequency")
     if recurring and freq_token not in _CRM_FREQUENCY_BACK:
-        # Their enum has every_other_year; our engine's frequency table has no
-        # 24-month step, so there is nothing to map it to. Refuse loudly - the
-        # silent alternative (falling through to the "Monthly" default in
-        # normalise_goal) would turn a biennial goal into a monthly one and
-        # over-fund it twelvefold.
+        # Nothing in our frequency table maps to it; the silent alternative is
+        # normalise_goal's "Monthly" default, which would over-fund the goal.
         raise ValueError(
             f"goal {row.get('goal_name')!r}: frequency {freq_token!r} has no "
             "equivalent in the planner (we support monthly / quarterly / "
@@ -583,12 +585,10 @@ def _goal_from_crm_row(row: dict) -> dict:
         "amount": row.get("amount_per_occurrence"),
         "frequency": _CRM_FREQUENCY_BACK.get(freq_token),
         "occurrences": occ,
-        "end_mode": ("Lifetime" if open_ended
+        "end_mode": ("Lifetime" if (recurring and row.get("lifetime"))
                      else ("Occurrences" if recurring else None)),
         "end_date": None,
-        "inflation_percent": (float(row["inflation"]) * 100.0
-                              if row.get("inflation") is not None else None),
-        "purpose_id": row.get("purpose_id") or None,
+        "inflation_percent": round(float(row.get("inflation") or 0) * 100, 4),
         "goal_category": row.get("goal_type") or None,
     }
 
@@ -691,8 +691,7 @@ def form_state_from_inputs(doc: dict):
         raise ValueError("not an inputs JSON (missing 'goals')")
     today = month_start_today()
     # A CRM goals file is flat rows with no envelope. Translate it into our
-    # shape first so the rest of this function is unchanged - this is how
-    # CRM-minted purpose_ids come back to us (their spec, 2026-08-30).
+    # shape first so the rest of this function is unchanged.
     if doc.get("goals") and isinstance(doc["goals"][0], dict)             and "goal_name" in doc["goals"][0]:
         doc = dict(doc)
         doc.setdefault("personal", {})
@@ -784,10 +783,9 @@ def form_state_from_inputs(doc: dict):
             "amount": int(float(g.get("amount") or 0)),
             "frequency": freq if freq in RECURRING_FREQUENCIES else "Annual",
             "occurrences": int(float(g.get("occurrences") or 1)),
-            "end_mode": end_mode,
+            "end_mode": "Lifetime" if g.get("lifetime") else end_mode,
             "end_date": ts(g.get("end_date")),
             "inflation_percent": num(g.get("inflation_percent"), 6.0),
-            "purpose_id": g.get("purpose_id") or None,
             "goal_category": g.get("goal_category") or None,
         }))
 
@@ -1402,8 +1400,6 @@ def render_goal(g: dict) -> None:
         help="The CRM's own goal taxonomy. Optional, but it is what their "
              "reporting groups goals by.",
     )
-    if g.get("purpose_id"):
-        st.caption(f"CRM id: `{g['purpose_id']}`")
 
     if g["structure"] == "Recurring":
         r5c1, r5c2, r5c3 = st.columns(3)
@@ -1488,7 +1484,6 @@ def build_config(personal: dict) -> dict:
             "end_date": g["end_date"],
             "inflation_percent": float(g["inflation_percent"]),
             "payments_fixed_at_start": payments_fixed_for(g),
-            "purpose_id": g.get("purpose_id") or None,
             "goal_category": g.get("goal_category") or None,
         })
     one_time = [
@@ -1989,9 +1984,9 @@ def render_results(out: dict) -> None:
     st.caption(
         "**Inputs (JSON)** is our own record — it reloads into this form. "
         "**CRM goals upload** is the CRM's strict contract: flat rows in their "
-        "vocabulary, 'At retirement' resolved to the solved date, and a "
-        f"lifetime series written as {CRM_OPEN_ENDED_OCCURRENCES} payments. "
-        "Load a CRM goals file back here to pick up the ids they mint."
+        "vocabulary, with 'At retirement' resolved to the solved date. It is "
+        "an *add* file — the CRM appends these goals to the client's list, so "
+        "it never edits or removes what is already there."
     )
 
 

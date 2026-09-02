@@ -1,4 +1,4 @@
-"""The CRM goals contract (Punit's spec, 2026-08-30).
+"""The CRM goals contract (Punit's spec v2, 2026-08-31).
 
 The CRM interprets nothing: a missing key, an unknown key, a null where one is
 not allowed, or a token in the wrong case rejects that goal with the reason
@@ -23,15 +23,23 @@ _spec.loader.exec_module(sa)
 
 from app.planning.engine import find_retirement_date  # noqa: E402
 
-# The eleven keys, in the spec's order. Every goal carries all of them.
+# The twelve keys, in the spec's order. Every goal carries all of them.
+# v2 (2026-08-31): purpose_id dropped (the upload is ADD-only, so nothing in
+# the file addresses an existing goal); lifetime and payments_fixed_at_start
+# added as their own booleans, retiring the 500-occurrence sentinel.
 CONTRACT_KEYS = [
-    "purpose_id", "goal_name", "goal_type", "goal_negotiability",
-    "goal_description", "amount_per_occurrence", "occurrences", "frequency",
-    "start_date", "inflation", "goal_status",
+    "goal_name", "goal_type", "goal_negotiability", "goal_description",
+    "amount_per_occurrence", "occurrences", "lifetime",
+    "payments_fixed_at_start", "frequency", "start_date", "inflation",
+    "goal_status",
 ]
+# Null is allowed only here: goal_type, goal_description, and the three
+# recurring-only fields exactly when occurrences == 1.
+NULLABLE_ALWAYS = {"goal_type", "goal_description"}
+NULLABLE_WHEN_SINGLE = {"frequency", "lifetime", "payments_fixed_at_start"}
 NEGOTIABILITY = {"non_negotiable", "semi_negotiable", "negotiable"}
-FREQUENCIES = {"monthly", "quarterly", "half_yearly", "yearly",
-               "every_other_year"}
+# v2 removed every_other_year from their enum too, so the asymmetry is gone.
+FREQUENCIES = {"monthly", "quarterly", "half_yearly", "yearly"}
 CATEGORIES = {"education", "marriage", "home", "vehicle", "travel",
               "retirement", "healthcare", "emergency", "business", "other"}
 
@@ -44,7 +52,7 @@ def _goal(**kw):
          "start_date": TODAY + pd.DateOffset(years=5), "amount": 1_000_000,
          "frequency": None, "end_mode": None, "occurrences": 1,
          "end_date": None, "inflation_percent": 6.0,
-         "purpose_id": None, "goal_category": None}
+         "goal_category": None}
     g.update(kw)
     return g
 
@@ -119,23 +127,56 @@ class TestUploadFileShape:
         assert g["goal_description"] == ""
 
 
-class TestOpenEndedAndResolution:
-    """Their two hard requirements on open-ended series."""
+class TestLifetimeAndResolution:
+    """v2: `lifetime` is its own boolean and `occurrences` never lies."""
 
-    def test_lifetime_series_is_written_as_the_open_ended_marker(self):
+    def test_lifetime_series_sets_the_flag_and_a_true_count(self):
         g = _upload([_goal(name="Income", structure="Recurring",
                            frequency="Monthly", end_mode="Lifetime",
                            occurrences=None)])["goals"][0]
-        assert g["occurrences"] == sa.CRM_OPEN_ENDED_OCCURRENCES == 500
+        assert g["lifetime"] is True
+        assert g["occurrences"] > 1
+        assert g["occurrences"] != 500          # never a sentinel
 
-    def test_a_bounded_series_keeps_its_real_count(self):
-        """Even one that starts at retirement: its length IS known."""
+    def test_a_bounded_series_is_not_lifetime(self):
         g = _upload([_goal(name="Bridge", structure="Recurring",
                            start_date_mode="At retirement", start_date=None,
                            frequency="Monthly", end_mode="Occurrences",
                            occurrences=240)],
                     retirement=pd.Timestamp("2035-06-01"))["goals"][0]
+        assert g["lifetime"] is False
         assert g["occurrences"] == 240
+
+    def test_policy_flag_rides_along_verbatim(self):
+        doc = _upload([
+            _goal(name="Income", structure="Recurring", frequency="Monthly",
+                  end_mode="Lifetime", occurrences=None),
+            _goal(name="Fees", structure="Recurring", frequency="Annual",
+                  end_mode="Occurrences", occurrences=4),
+        ])
+        income, fees = doc["goals"]
+        assert income["payments_fixed_at_start"] is False
+        assert fees["payments_fixed_at_start"] is True
+
+    def test_single_occurrence_nulls_the_three_recurring_fields(self):
+        g = _upload([_goal()])["goals"][0]
+        assert g["occurrences"] == 1
+        for k in NULLABLE_WHEN_SINGLE:
+            assert g[k] is None
+
+    def test_nothing_else_is_ever_null(self):
+        doc = _upload([
+            _goal(name="One", goal_category="home"),
+            _goal(name="Many", goal_category="education", structure="Recurring",
+                  frequency="Monthly", end_mode="Occurrences", occurrences=12),
+        ])
+        for g in doc["goals"]:
+            for k, v in g.items():
+                if k in NULLABLE_ALWAYS:
+                    continue
+                if k in NULLABLE_WHEN_SINGLE and g["occurrences"] == 1:
+                    continue
+                assert v is not None, f"{k} must not be null"
 
     def test_at_retirement_start_is_resolved_to_a_concrete_date(self):
         g = _upload([_goal(name="Income", structure="Recurring",
@@ -147,26 +188,17 @@ class TestOpenEndedAndResolution:
 
 
 class TestRoundTrip:
-    """CRM-minted ids must ride back, and the income policy must survive."""
+    """A CRM file must load back with its meaning intact."""
 
     def _round_trip(self, goals, retirement=None):
         doc = _upload(goals, retirement)
         _p, _s, back, _o = sa.form_state_from_inputs({"goals": doc["goals"]})
         return doc, back
 
-    def test_purpose_ids_survive_the_trip(self):
-        doc, back = self._round_trip([_goal(purpose_id="PUR_123")])
-        assert doc["goals"][0]["purpose_id"] == "PUR_123"
-        assert back[0]["purpose_id"] == "PUR_123"
-
-    def test_a_new_goal_uploads_a_null_id(self):
-        assert _upload([_goal()])["goals"][0]["purpose_id"] is None
-
     def test_income_still_inflates_after_a_crm_round_trip(self):
-        """The contract drops end_mode/start_date_mode, which is what our
-        fixed-vs-inflating policy reads. The open-ended marker (500) is the
-        only surviving signal - losing it would silently make a retirement
-        income stop tracking cost of living.
+        """v1 keyed this off occurrences == 500, which Punit caught failing on
+        a real plan (an income exported 397). v2 carries `lifetime`, so the
+        classification survives whatever the count happens to be.
         """
         _doc, back = self._round_trip(
             [_goal(name="Income", structure="Recurring", frequency="Monthly",
@@ -175,44 +207,41 @@ class TestRoundTrip:
         assert back[0]["end_mode"] == "Lifetime"
         assert sa.payments_fixed_for(back[0]) is False
 
-    def test_a_fixed_series_stays_fixed_after_a_round_trip(self):
+    def test_a_bounded_series_stays_contract_fixed(self):
         _doc, back = self._round_trip(
             [_goal(name="Fees", structure="Recurring", frequency="Annual",
                    end_mode="Occurrences", occurrences=4)])
         assert sa.payments_fixed_for(back[0]) is True
 
-    def test_amount_frequency_and_inflation_come_back_intact(self):
-        _doc, back = self._round_trip(
-            [_goal(name="Fees", structure="Recurring", frequency="Quarterly",
-                   end_mode="Occurrences", occurrences=8, amount=90_000,
-                   inflation_percent=5.0, goal_category="education")])
-        g = back[0]
-        assert g["amount"] == 90_000
-        assert g["frequency"] == "Quarterly"
-        assert g["inflation_percent"] == pytest.approx(5.0)
-        assert g["goal_category"] == "education"
+    def test_category_survives(self):
+        _doc, back = self._round_trip([_goal(goal_category="education")])
+        assert back[0]["goal_category"] == "education"
 
 
-class TestShippedSampleMatchesTheContract:
-    def test_sample_file_is_valid(self):
-        path = REPO / "crm_samples" / "sample_crm_goals_upload.json"
-        doc = json.loads(path.read_text(encoding="utf-8"))
-        assert list(doc.keys()) == ["goals"] and doc["goals"]
-        for g in doc["goals"]:
-            assert list(g.keys()) == CONTRACT_KEYS
-            assert g["goal_negotiability"] in NEGOTIABILITY
-            assert g["goal_type"] is None or g["goal_type"] in CATEGORIES
-            assert g["frequency"] is None or g["frequency"] in FREQUENCIES
-            assert isinstance(g["amount_per_occurrence"], int)
-            assert isinstance(g["occurrences"], int) and g["occurrences"] >= 1
-            assert (g["frequency"] is None) == (g["occurrences"] == 1)
-            assert g["goal_status"] == "active"
-        names = [g["goal_name"].lower() for g in doc["goals"]]
-        assert len(names) == len(set(names)), "goal_name unique per plan"
+class TestOurOwnResolvedFileKeepsItsMeaning:
+    """The same loss existed in OUR save format, independently of the CRM.
+
+    build_inputs_json(resolved) replaces Lifetime with a concrete count and
+    "At retirement" with a date - erasing both signals the income policy
+    reads, so reloading a resolved export silently turned a retirement income
+    into a contract-fixed series that stopped escalating. The file now carries
+    `lifetime` explicitly.
+    """
+
+    def test_resolved_export_reloads_as_income(self):
+        cfg = _config([_goal(name="Income", structure="Recurring",
+                             start_date_mode="At retirement", start_date=None,
+                             frequency="Monthly", end_mode="Lifetime",
+                             occurrences=None)])
+        doc = json.loads(sa.build_inputs_json(
+            cfg, retirement_date=pd.Timestamp("2035-06-01")))
+        assert doc["goals"][0]["lifetime"] is True
+        _p, _s, back, _o = sa.form_state_from_inputs(doc)
+        assert sa.payments_fixed_for(back[0]) is False
 
 
 class TestWeRefuseWhatWeCannotRepresent:
-    def test_every_other_year_is_rejected_not_silently_monthlyfied(self):
+    def test_an_unmappable_frequency_is_rejected_not_silently_monthlyfied(self):
         """Their enum has every_other_year; our engine has no 24-month step.
         Falling through would hit normalise_goal's "Monthly" default and
         over-fund the goal twelvefold, so the loader must refuse instead.

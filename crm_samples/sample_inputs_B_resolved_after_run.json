@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-30 07:28:40",
+  "generated_at": "2026-09-02 07:58:24",
   "simulation_id": "SIM-SAMPLE-CONTRACT-DEMO",
   "retirement_mode": "earliest",
   "target_date": null,
@@ -9,7 +9,7 @@
   "personal": {
     "client_name": "Sample Client (contract demo)",
     "phone": "9999999999",
-    "current_date": "2026-08-01",
+    "current_date": "2026-09-01",
     "current_age": 40.0,
     "target_lifetime": 90.0,
     "current_corpus": 30000000.0,
@@ -19,12 +19,12 @@
     {
       "name": "Salary",
       "amount": 250000.0,
-      "start_date": "2026-08-01",
+      "start_date": "2026-09-01",
       "end_date_mode": "At retirement",
       "end_date": null,
       "step_up_percent": 8.0,
       "step_up_frequency": "Annual",
-      "step_up_date": "2026-08-01"
+      "step_up_date": "2026-09-01"
     }
   ],
   "goals": [
@@ -35,7 +35,7 @@
       "nature": "Non-replenishing",
       "structure": "Lumpsum",
       "start_date_mode": "Fixed",
-      "start_date": "2030-08-01",
+      "start_date": "2030-09-01",
       "amount": 4000000.0,
       "inflation_percent": 6.0
     },
@@ -46,7 +46,7 @@
       "nature": "Replenishing",
       "structure": "Lumpsum",
       "start_date_mode": "Fixed",
-      "start_date": "2038-08-01",
+      "start_date": "2038-09-01",
       "amount": 3000000.0,
       "inflation_percent": 7.0
     },
@@ -57,7 +57,7 @@
       "nature": "Replenishing",
       "structure": "Lumpsum",
       "start_date_mode": "Fixed",
-      "start_date": "2034-08-01",
+      "start_date": "2034-09-01",
       "amount": 1500000.0,
       "inflation_percent": 6.0
     },
@@ -68,13 +68,14 @@
       "nature": "Replenishing",
       "structure": "Recurring",
       "start_date_mode": "Fixed",
-      "start_date": "2036-08-01",
+      "start_date": "2036-09-01",
       "amount": 1200000.0,
       "frequency": "Annual",
       "occurrences": 4,
-      "end_date": "2039-08-01",
+      "end_date": "2039-09-01",
       "inflation_percent": 8.0,
-      "payments_fixed_at_start": true
+      "payments_fixed_at_start": true,
+      "lifetime": false
     },
     {
       "name": "Home Loan EMI",
@@ -83,13 +84,14 @@
       "nature": "Replenishing",
       "structure": "Recurring",
       "start_date_mode": "Fixed",
-      "start_date": "2026-08-01",
+      "start_date": "2026-09-01",
       "amount": 45000.0,
       "frequency": "Monthly",
       "occurrences": 180,
-      "end_date": "2041-07-01",
+      "end_date": "2041-08-01",
       "inflation_percent": 0.0,
-      "payments_fixed_at_start": true
+      "payments_fixed_at_start": true,
+      "lifetime": false
     },
     {
       "name": "Parents Support",
@@ -98,13 +100,14 @@
       "nature": "Replenishing",
       "structure": "Recurring",
       "start_date_mode": "Fixed",
-      "start_date": "2027-08-01",
+      "start_date": "2027-09-01",
       "amount": 90000.0,
       "frequency": "Quarterly",
       "occurrences": 21,
-      "end_date": "2032-08-01",
+      "end_date": "2032-09-01",
       "inflation_percent": 5.0,
-      "payments_fixed_at_start": true
+      "payments_fixed_at_start": true,
+      "lifetime": false
     },
     {
       "name": "Retirement Income",
@@ -113,13 +116,14 @@
       "nature": "Replenishing",
       "structure": "Recurring",
       "start_date_mode": "Fixed",
-      "start_date": "2031-09-01",
+      "start_date": "2031-10-01",
       "amount": 125000.0,
       "frequency": "Monthly",
       "occurrences": 540,
-      "end_date": "2076-08-01",
+      "end_date": "2076-09-01",
       "inflation_percent": 6.0,
-      "payments_fixed_at_start": false
+      "payments_fixed_at_start": false,
+      "lifetime": true
     },
     {
       "name": "Child Education 2",
@@ -128,19 +132,20 @@
       "nature": "Replenishing",
       "structure": "Recurring",
       "start_date_mode": "Fixed",
-      "start_date": "2040-08-01",
+      "start_date": "2040-09-01",
       "amount": 1200000.0,
       "frequency": "Annual",
       "occurrences": 4,
-      "end_date": "2043-08-01",
+      "end_date": "2043-09-01",
       "inflation_percent": 8.0,
-      "payments_fixed_at_start": true
+      "payments_fixed_at_start": true,
+      "lifetime": false
     }
   ],
   "one_time_investments": [
     {
       "name": "Bonus",
-      "date": "2027-08-01",
+      "date": "2027-09-01",
       "amount": 1500000.0
     }
   ]
