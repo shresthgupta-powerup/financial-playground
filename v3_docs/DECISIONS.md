@@ -6,6 +6,56 @@ This file is seeded from the commit history that's actually in the repo today (2
 
 ---
 
+## 2026-09-04 - Goal parking page: the grid's dated movements per CRM goal
+
+**What:** a second Streamlit page (`pages/Goal_parking.py`) backed by a pure
+module (`app/planning/parking.py`). Upload the CRM's purposes export (CSV or
+XLSX, contract-v2 columns) and, for every active goal as of a chosen month:
+
+- whether anything is due yet - if not, the FIRST movement month and lump;
+- if the window is already open, what should ALREADY be parked in debt and
+  hybrid (the catch-up lump), the next movement and its amount;
+- the full schedule of dated movements: into debt, into hybrid, and the
+  hybrid -> debt switch a non-negotiable goal makes in its final year, each
+  with the payment it serves and what it delivers after tax;
+- family totals across goals, and a CSV of every movement.
+
+**Model's truth, not a SIP (advisory head, 2026-09-04):** the page shows the
+lump movements out of the core corpus that the simulator actually executes.
+An earlier framing - "put X each month into hybrid" - was withdrawn by the
+requester as not how the model works; no monthly translation is shown.
+
+**Two conventions, both deliberate:**
+- Amounts escalate from the CRM's `amount_as_of` (the date the today's-rupees
+  figure was struck), not from the as-of date. Escalating from today would
+  under-provision every goal by the time elapsed since entry. Stated on the
+  page.
+- A payment already inside its carve window at the as-of date has its
+  earlier slices clamped to the as-of month by `grid_slice_plan`, which is
+  exactly the catch-up semantics wanted: "should already hold X".
+
+**Standalone by construction:** contract-v2 rows carry resolved start dates
+and true occurrence counts, so no plan context (solver, corpus, other goals)
+is needed - 616 goals compute in seconds. The same module is the requirements
+half of the fuller reconciliation design (Goal Parking Monitor spec,
+2026-09-04), which stays parked until per-goal folio tagging exists.
+
+**Readability:** an income goal moves money every month for decades (the
+sample's SWP: 1,191 monthly rows). The page shows month-level detail for the
+first 12 months and a yearly rollup after; the CSV keeps every month.
+
+**Verified on the requester's own export** (Navin Jhanji & Family): DJ1
+Marriage, Rs 60L struck Jul 2026 for Jan 2028, 8% - should already hold
+Rs 47.18L in debt and Rs 15.6L in hybrid, with Rs 16L switching hybrid ->
+debt in Jan 2027. Matches the hand estimate made before building.
+
+**Tests:** `test_parking.py` (13) - row conversion incl. refusing unknown
+frequencies, first-move month by reach (with the 365.25 leap-day effect
+pinned: a 3-year reach on Jun 2033 first moves in JUL 2030), catch-up lumps
+and the scheduled switch, slices delivering exactly the payment, escalation
+anchored on `amount_as_of`, fixed vs escalating series, completed goals,
+family totals and the active/cancelled filter.
+
 ## 2026-08-31 - CRM goals contract v2, and the income flag it rescued
 
 **What changed:** Punit's v2 spec, built and shipped the same day.
