@@ -111,6 +111,32 @@ def yearly_frame(monthly: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def goal_split_frame(plans, as_of: pd.Timestamp) -> pd.DataFrame:
+    """The first look: every active goal, what it needs NOW, and its next move.
+    Goals that need nothing yet say so, with their first movement month."""
+    rows = []
+    for p in plans:
+        d, h, sw = p["due_now"]["debt"], p["due_now"]["hybrid"], p.get("switch_now", 0.0)
+        nm = p.get("next_move")
+        if p["status"] == STATUS_COMPLETED:
+            status, nxt = "All payments in the past", "—"
+        elif p["status"] == STATUS_NOT_STARTED:
+            status = f"Nothing due yet · first movement {mon(p['first_move'])}"
+            nxt = mon(p["first_move"])
+        else:
+            status = "Due now"
+            nxt = mon(nm["month"]) if nm else "—"
+        rows.append({
+            "Goal": p["name"],
+            "Should be in debt now": short_inr(d) if d > 0.5 else "—",
+            "Should be in hybrid now": short_inr(h) if h > 0.5 else "—",
+            "Switch hybrid → debt now": short_inr(sw) if sw > 0.5 else "—",
+            "Next movement": nxt,
+            "Status": status,
+        })
+    return pd.DataFrame(rows)
+
+
 def split_schedule(monthly: pd.DataFrame, as_of: pd.Timestamp):
     """(detail, rollup): month-level for the first DETAIL_MONTHS, yearly after."""
     if monthly.empty:
@@ -210,6 +236,12 @@ for family, fdf in families:
         )
     else:
         st.markdown(f"As of **{mon(as_of)}**, nothing is due yet for this family's goals.")
+
+    split = goal_split_frame(plans, as_of)
+    st.dataframe(split, use_container_width=True, hide_index=True,
+                 height=38 + 35 * len(split))
+    st.caption(f"{len(plans)} active goal{'s' if len(plans) != 1 else ''} in this file — "
+               "cancelled and deleted goals are excluded. Detail per goal below.")
 
     all_rows = []
     for p in plans:
